@@ -74,6 +74,9 @@ static uint8_t connected_count;
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
 static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
+/* UNDS: physical L2/R2 travel (0-255) of the last host sample, before the press threshold and
+ * the 255 the game is given for a pressed trigger. Written and read under `lock`. */
+static uint8_t host_trigger[2];
 static uint16_t touch_axis(float v, int max) {
     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
 }
@@ -845,6 +848,7 @@ static int prompts_pad_device(SDL_Gamepad *g) {
 
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
+    host_trigger[0]=host_trigger[1]=0;
     d->left_x=d->left_y=d->right_x=d->right_y=128;
     d->orientation[3]=1.0f;
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
@@ -877,12 +881,14 @@ static void sample_host(PadData *d) {
             else if (b==PAD_TRIGGER_LEFT || b==PAD_TRIGGER_RIGHT) {
                 const uint8_t v=trigger(SDL_GetGamepadAxis(g,b==PAD_TRIGGER_LEFT ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER
                                                                               : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-                if (v>30) d->buttons|=actions[a].ps;
+                if (v>runtime_unds_trigger_threshold(b==PAD_TRIGGER_RIGHT)) d->buttons|=actions[a].ps; /* 30 unless UNDS_TRIGGER */
                 if (actions[a].ps==BTN_L2 && v>d->l2) d->l2=v;
                 if (actions[a].ps==BTN_R2 && v>d->r2) d->r2=v;
             }
         }
         if (SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_TOUCHPAD)) d->buttons|=BTN_TOUCHPAD; /* DualSense/DS4 click */
+        host_trigger[0]=trigger(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
+        host_trigger[1]=trigger(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
         if ((d->buttons & BTN_L2) && !d->l2) d->l2=255;
         if ((d->buttons & BTN_R2) && !d->r2) d->r2=255;
         d->left_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTX)); d->left_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTY));
@@ -1151,9 +1157,11 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     if (!data) return ERR_INVALID_ARG;
     pthread_mutex_lock(&lock);
     sample(data); ++reads;
+    const uint8_t l2_travel=host_trigger[0], r2_travel=host_trigger[1];
     pthread_mutex_unlock(&lock);
     /* UNDS: the state the game just read; published outside `lock` (data is the caller's buffer). */
-    runtime_unds_pad(data->buttons,data->left_x,data->left_y,data->right_x,data->right_y,data->l2,data->r2);
+    runtime_unds_pad(data->buttons,data->left_x,data->left_y,data->right_x,data->right_y,data->l2,data->r2,
+                     l2_travel,r2_travel);
     return 0;
 }
 /* Buffered read: the port samples once per call, so one entry is returned. */
@@ -1196,11 +1204,13 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
 }
 /* Light bar {r, g, b}: shown on controllers that have one (DualShock 4, DualSense). */
 static void set_led(uint8_t r, uint8_t g, uint8_t b) {
-    pthread_mutex_lock(&lock);
-    SDL_Gamepad *pad=current_gamepad();
-    if (pad) SDL_SetGamepadLED(pad,r,g,b);
-    pthread_mutex_unlock(&lock);
-    runtime_unds_led(r,g,b);
+    if (runtime_unds_led_enabled()) {
+        pthread_mutex_lock(&lock);
+        SDL_Gamepad *pad=current_gamepad();
+        if (pad) SDL_SetGamepadLED(pad,r,g,b);
+        pthread_mutex_unlock(&lock);
+    }
+    runtime_unds_led(r,g,b); /* UNDS: published also with UNDS_LED=0 */
 }
 static ABI int32_t pad_light_bar(int32_t handle, const uint8_t *rgb) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;

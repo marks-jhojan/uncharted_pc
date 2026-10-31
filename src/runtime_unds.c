@@ -20,12 +20,14 @@
  *
  * Events (fields after v, seq, t, e):
  *   hello  boot(1 first, 0 heartbeat) exe(u1 u2 u3 or file) bin pid base("0x...") ver up(ms)
- *          rumble(1 SDL rumble on) sent drop err smax(longest sendto since last hello, us)
+ *          rumble(1 SDL rumble on) led(1 SDL light bar on) trig("l2,r2" press thresholds)
+ *          sent drop err smax(longest sendto since last hello, us)
  *          vib(scePadSetVibration calls) ports("id:type:channels:frames,...")
  *   bye    reason
  *   rumble l s (0-255) re(1 refresh)
  *   led    r g b re(1 refresh)
- *   pad    b(button mask, BTN_* of runtime_pad.c) lx ly rx ry l2 r2 (0-255)
+ *   pad    b(button mask, BTN_* of runtime_pad.c) lx ly rx ry l2 r2 (0-255, what the game read;
+ *          the port gives 0 or 255 for the triggers) l2a r2a (physical trigger travel 0-255)
  *   aopen  p(port) ty(type) ch fr(frames per buffer)
  *   audio  p ty f(first frame of the window, port timeline) n(frames) rms pk lf
  *          levels x10000 of full scale over the window: rms of L/R (8 channels folded like the
@@ -67,12 +69,15 @@ typedef SOCKET unds_socket_t;
 #define AUDIO_WINDOW 512       /* frames per audio event: 10.67 ms at 48 kHz */
 #define PAD_MIN_INTERVAL_US 8000
 #define STICK_DEADBAND 2
+#define TRIGGER_THRESHOLD_DEFAULT 30   /* runtime_pad.c sample_host() before UNDS_TRIGGER */
 #define HEARTBEAT_TICK_NS 250000000u
 #define SLOW_SEND_NS 1000000u
 
 static _Atomic int active;     /* sending */
 static _Atomic int configured; /* UNDS_EVENTS was set (the report prints) */
 static _Atomic int rumble_on=1;
+static _Atomic int led_on=1;
+static _Atomic int trigger_threshold[2]={TRIGGER_THRESHOLD_DEFAULT,TRIGGER_THRESHOLD_DEFAULT};
 static _Atomic int bye_done;
 static unds_socket_t sock=UNDS_INVALID_SOCKET;
 static struct sockaddr_in destination;
@@ -86,7 +91,7 @@ static unsigned long process_id;
 static char exe_id[16], exe_file[64];
 
 static pthread_mutex_t state_lock=PTHREAD_MUTEX_INITIALIZER;
-typedef struct { uint32_t b; uint8_t a[6]; } PadState; /* lx ly rx ry l2 r2 */
+typedef struct { uint32_t b; uint8_t a[8]; } PadState; /* lx ly rx ry l2 r2 l2a r2a */
 static PadState pad_sent, pad_now;
 static int pad_valid, pad_pending;
 static uint64_t pad_sent_us;
@@ -222,18 +227,20 @@ static void send_hello(int boot) {
     pthread_mutex_unlock(&state_lock);
     const uint64_t smax=atomic_exchange_explicit(&send_max_ns,0,memory_order_relaxed);
     emit("hello",",\"boot\":%d,\"exe\":\"%s\",\"bin\":\"%s\",\"pid\":%lu,\"base\":\"0x%" PRIxPTR "\",\"ver\":\"%s\","
-         "\"up\":%" PRIu64 ",\"rumble\":%d,\"sent\":%" PRIu64 ",\"drop\":%" PRIu64 ",\"err\":%" PRIu64 ","
+         "\"up\":%" PRIu64 ",\"rumble\":%d,\"led\":%d,\"trig\":\"%d,%d\",\"sent\":%" PRIu64 ",\"drop\":%" PRIu64 ",\"err\":%" PRIu64 ","
          "\"smax\":%" PRIu64 ",\"vib\":%" PRIu64 ",\"ports\":\"%s\"",
          boot,exe_id,exe_file,process_id,image_base,UNDS_VERSION,(now_us()-start_us)/1000u,
-         atomic_load_explicit(&rumble_on,memory_order_relaxed),
+         atomic_load_explicit(&rumble_on,memory_order_relaxed),atomic_load_explicit(&led_on,memory_order_relaxed),
+         atomic_load_explicit(&trigger_threshold[0],memory_order_relaxed),
+         atomic_load_explicit(&trigger_threshold[1],memory_order_relaxed),
          atomic_load_explicit(&sent,memory_order_relaxed),atomic_load_explicit(&dropped,memory_order_relaxed),
          atomic_load_explicit(&errors,memory_order_relaxed),smax/1000u,
          atomic_load_explicit(&vibration_calls,memory_order_relaxed),ports);
 }
 
 static void send_pad(const PadState *s) {
-    emit("pad",",\"b\":%" PRIu32 ",\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,\"l2\":%u,\"r2\":%u",
-         s->b,s->a[0],s->a[1],s->a[2],s->a[3],s->a[4],s->a[5]);
+    emit("pad",",\"b\":%" PRIu32 ",\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,\"l2\":%u,\"r2\":%u,\"l2a\":%u,\"r2a\":%u",
+         s->b,s->a[0],s->a[1],s->a[2],s->a[3],s->a[4],s->a[5],s->a[6],s->a[7]);
 }
 /* The pending pad state, when the rate limit allows it now (called with state_lock held). */
 static int take_pad(uint64_t now, PadState *out) {
@@ -243,7 +250,12 @@ static int take_pad(uint64_t now, PadState *out) {
 }
 static int pad_differs(const PadState *a, const PadState *b) {
     if (a->b!=b->b || a->a[4]!=b->a[4] || a->a[5]!=b->a[5]) return 1;
-    for (int i=0;i<4;++i) { int d=(int)a->a[i]-(int)b->a[i]; if (d>=STICK_DEADBAND || d<=-STICK_DEADBAND) return 1; }
+    /* sticks and physical trigger travel: noise below the deadband is not a change */
+    for (int i=0;i<8;++i) {
+        if (i==4 || i==5) continue;
+        int d=(int)a->a[i]-(int)b->a[i];
+        if (d>=STICK_DEADBAND || d<=-STICK_DEADBAND) return 1;
+    }
     return 0;
 }
 
@@ -319,11 +331,40 @@ static int open_socket(void) {
     return 0;
 }
 
+/* "l2,r2", each 1-254. */
+static int parse_thresholds(const char *text, int out[2]) {
+    for (int i=0;i<2;++i) {
+        if (*text<'0' || *text>'9') return -1;
+        int v=0, len=0;
+        while (*text>='0' && *text<='9') { v=v*10+(*text++-'0'); if (++len>3) return -1; }
+        if (v<1 || v>254) return -1;
+        out[i]=v;
+        if (!i) { if (*text!=',') return -1; ++text; }
+    }
+    return *text ? -1 : 0;
+}
+
 void runtime_unds_start(uintptr_t image) {
     const char *rumble=getenv("UNDS_RUMBLE");
     if (rumble && !strcmp(rumble,"0")) {
         atomic_store(&rumble_on,0);
         puts("Runtime: UNDS: SDL rumble off (UNDS_RUMBLE=0); scePadSetVibration is still published");
+    }
+    const char *led=getenv("UNDS_LED");
+    if (led && !strcmp(led,"0")) {
+        atomic_store(&led_on,0);
+        puts("Runtime: UNDS: SDL light bar off (UNDS_LED=0); the light bar is still published");
+    }
+    const char *thresholds=getenv("UNDS_TRIGGER");
+    if (thresholds && *thresholds) {
+        int t[2];
+        if (parse_thresholds(thresholds,t))
+            printf("Runtime: UNDS: UNDS_TRIGGER=\"%s\" is not <l2>,<r2> (1-254 each); thresholds stay %d,%d\n",thresholds,
+                   atomic_load(&trigger_threshold[0]),atomic_load(&trigger_threshold[1]));
+        else {
+            atomic_store(&trigger_threshold[0],t[0]); atomic_store(&trigger_threshold[1],t[1]);
+            printf("Runtime: UNDS: trigger press thresholds L2>%d R2>%d of 255 (UNDS_TRIGGER)\n",t[0],t[1]);
+        }
     }
     const char *target=getenv("UNDS_EVENTS");
     if (!target || !*target || atomic_load(&active)) return;
@@ -356,6 +397,10 @@ void runtime_unds_start(uintptr_t image) {
 }
 
 int runtime_unds_rumble_enabled(void) { return atomic_load_explicit(&rumble_on,memory_order_relaxed); }
+int runtime_unds_led_enabled(void) { return atomic_load_explicit(&led_on,memory_order_relaxed); }
+uint8_t runtime_unds_trigger_threshold(int right) {
+    return (uint8_t)atomic_load_explicit(&trigger_threshold[right ? 1 : 0],memory_order_relaxed);
+}
 
 void runtime_unds_bye(const char *reason) {
     if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
@@ -388,10 +433,11 @@ void runtime_unds_led(uint8_t r, uint8_t g, uint8_t b) {
     if (changed) emit("led",",\"r\":%u,\"g\":%u,\"b\":%u",r,g,b);
 }
 
-void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2) {
+void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2,
+                      uint8_t l2a, uint8_t r2a) {
     if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
     const uint64_t now=now_us();
-    const PadState state={buttons,{lx,ly,rx,ry,l2,r2}};
+    const PadState state={buttons,{lx,ly,rx,ry,l2,r2,l2a,r2a}};
     PadState out; int send;
     pthread_mutex_lock(&state_lock);
     pad_now=state;

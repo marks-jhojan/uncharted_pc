@@ -1,5 +1,5 @@
 /* UNDS event bus: endpoint parsing, change detection, pad rate limit, audio levels, protocol
- * fields, seq continuity and "bye". Sends to a UDP socket of its own on 127.0.0.1.
+ * fields, seq continuity, "bye", UNDS_LED and UNDS_TRIGGER. Sends to a UDP socket of its own on 127.0.0.1.
  * Linux:            cc -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c -lm -o out/unds-test
  * MSYS2 CLANG64:    clang -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c src/compat_win.c -lws2_32 -lbcrypt -o out/unds-test.exe */
 #include "../src/runtime_unds.c"
@@ -73,6 +73,15 @@ static void test_parse(void) {
     for (size_t i=0;i<sizeof(bad)/sizeof(*bad);++i) assert(parse_endpoint(bad[i],&ip,&port));
 }
 
+static void test_thresholds(void) {
+    int t[2]={0,0};
+    assert(!parse_thresholds("30,30",t) && t[0]==30 && t[1]==30);
+    assert(!parse_thresholds("1,254",t) && t[0]==1 && t[1]==254);
+    assert(!parse_thresholds("40,140",t) && t[0]==40 && t[1]==140);
+    const char *bad[]={"", "30", "30,", ",30", "0,30", "30,255", "30;30", "30,30,30", "a,30", "30, 30", "1000,30", "-1,30"};
+    for (size_t i=0;i<sizeof(bad)/sizeof(*bad);++i) assert(parse_thresholds(bad[i],t));
+}
+
 static void test_audio(void) {
     char e[512];
     runtime_unds_audio_open(0,0,8,1024);
@@ -111,12 +120,23 @@ static void test_audio(void) {
 
 int main(void) {
     test_parse();
+    test_thresholds();
     set_env("BB_EXE","big2-ps4_Shipping.elf");
-    /* No UNDS_EVENTS: nothing is active, every call returns at once. */
+    /* No UNDS_* variables: defaults, nothing is active, every call returns at once. */
     runtime_unds_start(0x1234);
-    assert(!atomic_load(&active) && !atomic_load(&configured) && runtime_unds_rumble_enabled());
-    runtime_unds_rumble(1,2); runtime_unds_pad(0,1,2,3,4,5,6); runtime_unds_bye("x");
+    assert(!atomic_load(&active) && !atomic_load(&configured) && runtime_unds_rumble_enabled() && runtime_unds_led_enabled());
+    assert(runtime_unds_trigger_threshold(0)==30 && runtime_unds_trigger_threshold(1)==30);
+    runtime_unds_rumble(1,2); runtime_unds_pad(0,1,2,3,4,5,6,7,8); runtime_unds_bye("x");
     assert(!atomic_load(&bye_done) && !atomic_load(&sent));
+    /* UNDS_LED and UNDS_TRIGGER work without UNDS_EVENTS; a malformed UNDS_TRIGGER changes nothing */
+    set_env("UNDS_TRIGGER","30,300");
+    runtime_unds_start(0x1234);
+    assert(runtime_unds_trigger_threshold(0)==30 && runtime_unds_trigger_threshold(1)==30 && !atomic_load(&active));
+    set_env("UNDS_LED","0");
+    set_env("UNDS_TRIGGER","40,140");
+    runtime_unds_start(0x1234);
+    assert(!runtime_unds_led_enabled() && runtime_unds_trigger_threshold(0)==40 && runtime_unds_trigger_threshold(1)==140);
+    assert(!atomic_load(&active) && !atomic_load(&sent));
 
     char endpoint[64], e[512];
     open_receiver(endpoint,sizeof(endpoint));
@@ -126,7 +146,7 @@ int main(void) {
     assert(atomic_load(&active) && !runtime_unds_rumble_enabled());
     assert(receive(e,sizeof(e),500) && has(e,"\"e\":\"hello\"") && field(e,"seq")==0 && field(e,"boot")==1);
     assert(has(e,"\"exe\":\"u2\"") && has(e,"\"bin\":\"big2-ps4_Shipping.elf\"") && has(e,"\"base\":\"0xb400000\""));
-    assert(field(e,"rumble")==0 && field(e,"pid")>0);
+    assert(field(e,"rumble")==0 && field(e,"led")==0 && has(e,"\"trig\":\"40,140\"") && field(e,"pid")>0);
     expect_seq=1;
 
     /* rumble and LED: only changes */
@@ -141,16 +161,18 @@ int main(void) {
     no_event(30);
 
     /* pad: first state, stick noise below the deadband, buttons through the limit, analog held */
-    runtime_unds_pad(0,128,128,128,128,0,0);
-    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"pad\"") && field(e,"lx")==128);
-    runtime_unds_pad(0,129,127,128,128,0,0);
+    runtime_unds_pad(0,128,128,128,128,0,0,0,0);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"pad\"") && field(e,"lx")==128 && field(e,"r2a")==0);
+    runtime_unds_pad(0,129,127,128,128,0,0,1,1);             /* stick and trigger noise below the deadband */
     no_event(30);
-    runtime_unds_pad(0x200,128,128,128,128,0,255);           /* R2 pressed: sent at once */
-    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255);
-    runtime_unds_pad(0x200,128,128,128,128,0,200);           /* analog only, <8 ms later: held */
-    runtime_unds_pad(0x200,128,128,128,128,0,180);
-    assert(next_event(e,sizeof(e),400) && field(e,"r2")==180); /* sent by the heartbeat */
-    runtime_unds_pad(0,128,128,128,128,0,0);                 /* release: at once */
+    runtime_unds_pad(0,128,128,128,128,0,0,0,60);            /* R2 travel under the threshold: a change */
+    assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0 && field(e,"r2a")==60 && field(e,"l2a")==0);
+    runtime_unds_pad(0x200,128,128,128,128,0,255,0,150);     /* R2 pressed: sent at once */
+    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255 && field(e,"r2a")==150);
+    runtime_unds_pad(0x200,128,128,128,128,0,200,0,150);     /* analog only, <8 ms later: held */
+    runtime_unds_pad(0x200,128,128,128,128,0,180,0,170);
+    assert(next_event(e,sizeof(e),400) && field(e,"r2")==180 && field(e,"r2a")==170); /* sent by the heartbeat */
+    runtime_unds_pad(0,128,128,128,128,0,0,0,0);             /* release: at once */
     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0);
 
     test_audio();
