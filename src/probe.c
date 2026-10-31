@@ -789,6 +789,7 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
                                            0x41,0x54,0x41,0x55,0x41,0x57,
                                            0x48,0x89,0xe3,0x48,0x83,0xe4,0xf0,0x48,0x81,0xec,0xb0,0x00,0x00,0x00};
         memcpy(t+k,save,sizeof(save)); k+=sizeof(save);
+        /* runtime.h runtime_guest_xmm reads the xmm saves at this layout */
         for (int x=0;x<8;++x) {                                     /* movdqu [rsp+0x30+16x], xmmx */
             const uint32_t disp=0x30u+16u*(uint32_t)x;
             t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x7f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;

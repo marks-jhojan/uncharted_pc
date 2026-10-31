@@ -181,20 +181,13 @@ static void test_audio(void) {
 
 /* Game state: the callbacks on objects laid out like U1 1.00's (player, weapon controller,
  * weapons, handle slots, a damage record). */
-static void test_state(void) {
-    char e[512];
-    size_t count=0;
-    const RuntimeGuestCallback *c=runtime_unds_guest_callbacks(&count);
-    assert(count==4 && atomic_load(&state_enabled));
-    assert(c[0].callback==state_player && c[1].callback==state_controller && c[2].callback==state_shot && c[3].callback==state_damage);
-    assert(c[0].skip==0 && c[0].moved==6 && c[1].skip==0 && c[1].moved==6 && c[2].skip==21 && c[2].moved==5 &&
-           c[3].skip==26 && c[3].moved==6);
+/* the loader's pattern syntax: "xx" or "??" separated by single spaces; the hook and the moved
+   bytes lie inside the pattern and are not wildcards (they are copied to the thunk) */
+static void check_table(const RuntimeGuestCallback *c, size_t count, const char *prefix) {
     for (size_t i=0;i<count;++i) {
-        /* the loader's pattern syntax: "xx" or "??" separated by single spaces; the hook and the
-           moved bytes lie inside the pattern and are not wildcards (they are copied to the thunk) */
         const char *t=c[i].pattern;
         size_t n=0, len=strlen(t);
-        assert(len%3==2 && !strncmp(c[i].name,"UNDS U1 ",8) && !c[i].patch);
+        assert(len%3==2 && !strncmp(c[i].name,prefix,strlen(prefix)) && !c[i].patch && c[i].moved>=5);
         for (size_t k=0;k<len;k+=3,++n) {
             assert((isxdigit((unsigned char)t[k]) && isxdigit((unsigned char)t[k+1])) || (t[k]=='?' && t[k+1]=='?'));
             assert(k+2==len || t[k+2]==' ');
@@ -202,6 +195,16 @@ static void test_state(void) {
         }
         assert(c[i].skip+c[i].moved<=n);
     }
+}
+static void test_state(void) {
+    char e[512];
+    size_t count=0;
+    const RuntimeGuestCallback *c=runtime_unds_guest_callbacks(&count);
+    assert(count==4 && atomic_load(&state_enabled) && !atomic_load(&control_enabled));
+    assert(c[0].callback==state_player && c[1].callback==state_controller && c[2].callback==state_shot && c[3].callback==state_damage);
+    assert(c[0].skip==0 && c[0].moved==6 && c[1].skip==0 && c[1].moved==6 && c[2].skip==21 && c[2].moved==5 &&
+           c[3].skip==26 && c[3].moved==6);
+    check_table(c,count,"UNDS U1 ");
     static _Alignas(16) unsigned char player[0x1500], controller[0x200], rifle[0x500], grenade[0x500], damage[0x40], source[0x40];
     static _Alignas(16) float locator[12];
     static uint64_t rifle_slot, grenade_slot;
@@ -287,6 +290,118 @@ static void test_state(void) {
     /* unmapped memory: a read fails instead of faulting */
     char byte;
     assert(!peek(0x10,&byte,1) && !peek(UINTPTR_MAX-2,&byte,8));
+}
+
+/* U2: the frame hook (health fraction in the thunk's saved xmm0, weapon through the player's
+ * controller), the controller helper (upc), shots from the player's controller only, damage. */
+static void test_state_u2(void) {
+    char e[512];
+    size_t count=0;
+    set_env("BB_EXE","big2-ps4_Shipping.elf");
+    const RuntimeGuestCallback *c=runtime_unds_guest_callbacks(&count);
+    assert(count==4 && atomic_load(&state_enabled) && atomic_load(&control_enabled));
+    assert(c[0].callback==state_u2_frame && c[1].callback==state_u2_control && c[2].callback==state_u2_shot &&
+           c[3].callback==state_u2_damage);
+    assert(c[0].skip==42 && c[0].moved==7 && c[1].skip==0 && c[1].moved==6 && c[2].skip==45 && c[2].moved==5 &&
+           c[3].skip==35 && c[3].moved==8);
+    check_table(c,count,"UNDS U2 ");
+    static _Alignas(16) unsigned char player[0x3000], controller[0x300], pistol[0x700], other[0x300], health[0x40],
+                                      damage[0x40], source[0x200], helper[0x20], frame[0x200], frame2[0x200];
+    static uint64_t pistol_slot, source_slot;
+    float f; uint32_t u; int16_t ammo[3]; uint64_t p; int32_t i;
+    /* the thunk's frame: RuntimeGuestRegs at +0x100 (16-aligned), xmm0 saved at +0x100-0xb0+0x30 */
+    RuntimeGuestRegs *regs=(RuntimeGuestRegs *)(void *)(frame+0x100);
+    memset(regs,0,sizeof(*regs));
+    regs->r15=(uint64_t)(uintptr_t)player;
+    assert((const unsigned char *)runtime_guest_xmm(regs,0)==frame+0x80 && (const unsigned char *)runtime_guest_xmm(regs,2)==frame+0xa0);
+    /* player at (1, 2, 3), identity rotation; its controller (+0x128 = the player) holds a pistol in slot 3 */
+    /* player's own locator at (1, 2, 3), identity rotation, on an identity parent */
+    f=1.0f; memcpy(player+0x10c,&f,4); memcpy(player+0x12c,&f,4);
+    f=1.0f; memcpy(player+0x110,&f,4); f=2.0f; memcpy(player+0x114,&f,4); f=3.0f; memcpy(player+0x118,&f,4);
+    p=(uint64_t)(uintptr_t)controller; memcpy(player+0x2768,&p,8);
+    p=(uint64_t)(uintptr_t)player; memcpy(controller+0x128,&p,8);
+    u=0xff5403e6u; memcpy(pistol+0x550,&u,4); u=91; memcpy(pistol+0x44,&u,4);
+    ammo[0]=15; ammo[1]=45; ammo[2]=15; memcpy(pistol+0x620,ammo,6);
+    pistol_slot=(uint64_t)(uintptr_t)pistol; p=(uint64_t)(uintptr_t)&pistol_slot;
+    memcpy(controller+0x130+16*3,&p,8); memcpy(controller+0x130+16*3+8,&u,4);
+    controller[0x208]=3;
+    f=0.8f; memcpy(frame+0x80,&f,4);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"gs\"") && field(e,"hp")==800 && field(e,"ws")==3);
+    assert(has(e,"\"w\":\"0xff5403e6\"") && field(e,"clip")==15 && field(e,"res")==45 && field(e,"cap")==15 && field(e,"gr")==-1);
+    state_u2_frame(0,0,0x400000,0,regs);
+    no_event(30);
+    /* the helper of the player's controllers counts only with the player at +8 */
+    const uint64_t controls=atomic_load(&gs_control_calls);
+    p=(uint64_t)(uintptr_t)player; memcpy(helper+8,&p,8);
+    state_u2_control((uint64_t)(uintptr_t)helper,0,0,0,NULL);
+    p=1234; memcpy(helper+8,&p,8);
+    state_u2_control((uint64_t)(uintptr_t)helper,0,0,0,NULL);
+    assert(atomic_load(&gs_control_calls)==controls+1 && atomic_load(&ups_from_control));
+    /* a shot of the player's controller (the round before ConsumeRound takes it); another owner's is ignored */
+    RuntimeGuestRegs *shot=(RuntimeGuestRegs *)(void *)(frame2+0x100);
+    memset(shot,0,sizeof(*shot));
+    shot->r12=(uint64_t)(uintptr_t)controller;
+    state_u2_shot(0,0,0,(uint64_t)(uintptr_t)pistol,shot);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"shot\"") && has(e,"\"w\":\"0xff5403e6\"") && field(e,"clip")==15 &&
+           field(e,"res")==45 && field(e,"cap")==15);
+    memcpy(other,controller,sizeof(other)); p=1234; memcpy(other+0x128,&p,8);
+    shot->r12=(uint64_t)(uintptr_t)other;
+    state_u2_shot(0,0,0,(uint64_t)(uintptr_t)pistol,shot);
+    no_event(30);
+    ammo[0]=14; memcpy(pistol+0x620,ammo,6);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && field(e,"clip")==14);
+    /* stale handle (the id changed): no weapon; a controller of another object: no weapon either */
+    u=92; memcpy(pistol+0x44,&u,4);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && field(e,"ws")==-1 && has(e,"\"w\":\"0x0\"") && field(e,"clip")==-1);
+    u=91; memcpy(pistol+0x44,&u,4);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && field(e,"ws")==3);
+    p=(uint64_t)(uintptr_t)other; memcpy(player+0x2768,&p,8);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && field(e,"ws")==-1);
+    p=(uint64_t)(uintptr_t)controller; memcpy(player+0x2768,&p,8);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && field(e,"ws")==3);
+    /* damage: 25 of 100 health points from a source at (4, 2, 3) (handle at +8, id at +0x10) */
+    RuntimeGuestRegs *hit=(RuntimeGuestRegs *)(void *)(frame2+0x100);
+    memset(hit,0,sizeof(*hit));
+    hit->r15=(uint64_t)(uintptr_t)player; hit->r13=(uint64_t)(uintptr_t)damage; hit->r12=(uint64_t)(uintptr_t)health;
+    i=100; memcpy(health+0x30,&i,4); i=25; memcpy(damage+0x24,&i,4);
+    u=7; memcpy(source+0x44,&u,4); memcpy(damage+0x10,&u,4);
+    source_slot=(uint64_t)(uintptr_t)source; p=(uint64_t)(uintptr_t)&source_slot; memcpy(damage+8,&p,8);
+    /* the source on a platform at (10, 0, 0) turned 90 degrees about y: own (0, 2, 6) -> world (16, 2, 0)... */
+    f=10.0f; memcpy(source+0xf0,&f,4); f=0.70710678f; memcpy(source+0x104,&f,4); memcpy(source+0x10c,&f,4);
+    f=0.0f; memcpy(source+0x110,&f,4); f=2.0f; memcpy(source+0x114,&f,4); f=6.0f; memcpy(source+0x118,&f,4);
+    f=1.0f; memcpy(source+0x12c,&f,4);
+    state_u2_damage(0,0,0,0,hit);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"dmg\"") && field(e,"amt")==250 && field(e,"hpt")==25 && field(e,"hp")==800);
+    assert(field(e,"src")==1 && field(e,"sx")==16000 && field(e,"sy")==2000 && llabs(field(e,"sz"))<=1 && field(e,"loc")==1 &&
+           field(e,"px")==1000 && field(e,"py")==2000 && field(e,"pz")==3000 && field(e,"qw")==10000 && field(e,"qx")==0);
+    f=0.55f; memcpy(frame+0x80,&f,4);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"gs\"") && field(e,"hp")==550);
+    /* no source (a fall): src 0; damage to another object: nothing */
+    memset(damage+8,0,8);
+    state_u2_damage(0,0,0,0,hit);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"dmg\"") && field(e,"src")==0 && field(e,"sx")==0);
+    hit->r15=(uint64_t)(uintptr_t)other;
+    state_u2_damage(0,0,0,0,hit);
+    no_event(30);
+    /* death: the fraction reaches 0 */
+    f=0.0f; memcpy(frame+0x80,&f,4);
+    state_u2_frame(0,0,0x400000,0,regs);
+    assert(next_event(e,sizeof(e),500) && field(e,"hp")==0);
+    /* refreshes carry upc for U2 */
+    int upc=0;
+    for (int k=0;k<40 && !upc;++k) {
+        if (!receive(e,sizeof(e),100)) continue;
+        note_seq(e);
+        if (has(e,"\"e\":\"gs\"") && has(e,"\"re\":1")) { upc=1; assert(field(e,"upc")>=0 && field(e,"upf")>=0 && field(e,"ups")>=0 && field(e,"hp")==0); }
+    }
+    assert(upc);
 }
 
 /* The control channel: datagrams from `from` to the port's fx socket. */
@@ -482,8 +597,9 @@ int main(void) {
     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0);
 
     test_audio();
+    set_env("BB_EXE","big3-ps4_Shipping.elf");
     runtime_unds_guest_callbacks(&callbacks);
-    assert(!callbacks && !atomic_load(&state_enabled)); /* U2: the U1 game-state hooks are not handed out */
+    assert(!callbacks && !atomic_load(&state_enabled)); /* U3: no game-state hooks yet */
     set_env("BB_EXE","eboot.bin");
     test_state();
 
@@ -501,6 +617,7 @@ int main(void) {
         if (has(e,"\"e\":\"gs\"") && has(e,"\"re\":1")) { state_refresh=1; assert(field(e,"hp")==0 && field(e,"ups")>=0); }
     }
     assert(hello && refresh && state_refresh);
+    test_state_u2();
 
     test_fx(fx_udp);
     /* bye with R2 held: the triggers go off before the bye, and nothing is taken after it */

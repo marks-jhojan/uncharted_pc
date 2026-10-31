@@ -39,14 +39,16 @@
  *          stereo output: centre and surrounds at -3 dB, LFE dropped), peak |L|,|R|, and rms
  *          of (L+R)/2 low-passed at 150 Hz (one pole). Digital silence (pk 0) is sent once and
  *          then refreshed every 1 s instead of every window.
- *   gs     game state (UNDS_STATE, see the "Game state" section; U1 1.00 only so far):
+ *   gs     game state (UNDS_STATE, see the "Game state" section; U1 and U2):
  *          hp (player health x1000, 0-1000; -1 unknown) inj (1 injured) ws (weapon controller
  *          slot index, -1 none) w ("0x..." weapon type string id, "0x0" none) clip res cap (rounds
  *          in the clip, in reserve, clip size; -1 without a weapon) gr (grenades, -1 unknown);
  *          refreshes (re:1, every 0.5 s) add ups/wps (player / weapon controller updates in the
- *          last 0.5 s: 0 while the game does not run the player, e.g. cutscenes [HIPÓTESIS])
+ *          last 0.5 s: 0 while the game does not run the player, e.g. cutscenes [HIPÓTESIS]);
+ *          U2 adds upc (calls of a helper of the player's controllers) and upf (player frames)
+ *          in the last 0.5 s; ups is upc unless UNDS_U2_UPS=frame
  *   shot   w clip (before this round) res cap: the player's weapon fired one round
- *   dmg    ty (damage type) amt hp (x1000, health before) src(1 with a source) sx sy sz
+ *   dmg    ty (damage type) amt hp (x1000 of full health, health before) src(1 with a source) sx sy sz
  *          (source position, mm) px py pz (player position, mm) qx qy qz qw (player rotation
  *          x10000) */
 #define _GNU_SOURCE
@@ -759,7 +761,7 @@ void runtime_unds_audio(int port, int type, const void *pcm, int frames, int cha
 /* ------------------------------------------------------------------------------------------
  * Game state (UNDS_STATE). Callbacks in the game's own code (probe.c install_game_callbacks,
  * through runtime_guest_callbacks) read the player's health, weapon and ammunition where the game
- * itself uses them. They are handed to the loader only for U1 (BB_EXE), with UNDS_EVENTS set and
+ * itself uses them. They are handed to the loader for U1 and U2 (BB_EXE), with UNDS_EVENTS set and
  * UNDS_STATE not "0". The loader finds each site by its instruction pattern (RIP-relative
  * displacements and call targets are wildcards), which must match exactly once; a build without
  * that code gets 'Callbacks: UNDS U1 ... not found' and nothing is installed.
@@ -818,7 +820,9 @@ typedef struct { int32_t ws, clip, res, cap, gr, grr; uint32_t w; uint64_t us; }
 static _Atomic int state_enabled, state_debug, state_debug_lines, owner_confirmed;
 static _Atomic uintptr_t gs_player, gs_controller;
 static _Atomic uint64_t gs_player_calls, gs_controller_calls, gs_controller_foreign, gs_shots, gs_damages, gs_peek_failures;
-static uint64_t gs_player_refresh, gs_controller_refresh; /* heartbeat thread only */
+static _Atomic uint64_t gs_control_calls, gs_frame_calls; /* U2: both raw counts (upc, upf) */
+static _Atomic int ups_from_control;                      /* U2: which of them is ups */
+static uint64_t gs_player_refresh, gs_controller_refresh, gs_control_refresh, gs_frame_refresh; /* heartbeat thread only */
 /* under state_lock */
 static WeaponState gs_weapon;
 static GameState gs_sent;
@@ -914,9 +918,13 @@ static int state_due(const GameState *now_state, uint64_t now) {
     if (d>=GS_HP_STEP || now_state->hp<=0 || now_state->hp==1000) return 1;
     return now-gs_sent_us>=GS_SLOW_US;
 }
-static void send_state(const GameState *s, int refresh, uint64_t ups, uint64_t wps) {
-    char extra[64]="";
-    if (refresh) snprintf(extra,sizeof(extra),",\"re\":1,\"ups\":%" PRIu64 ",\"wps\":%" PRIu64,ups,wps);
+static _Atomic int control_enabled;
+static void send_state(const GameState *s, int refresh, uint64_t ups, uint64_t wps, uint64_t upc, uint64_t upf) {
+    char extra[128]="";
+    if (refresh && atomic_load_explicit(&control_enabled,memory_order_relaxed))
+        snprintf(extra,sizeof(extra),",\"re\":1,\"ups\":%" PRIu64 ",\"wps\":%" PRIu64 ",\"upc\":%" PRIu64 ",\"upf\":%" PRIu64,
+                 ups,wps,upc,upf);
+    else if (refresh) snprintf(extra,sizeof(extra),",\"re\":1,\"ups\":%" PRIu64 ",\"wps\":%" PRIu64,ups,wps);
     emit("gs",",\"hp\":%" PRId32 ",\"inj\":%" PRId32 ",\"ws\":%" PRId32 ",\"w\":\"0x%" PRIx32 "\",\"clip\":%" PRId32
          ",\"res\":%" PRId32 ",\"cap\":%" PRId32 ",\"gr\":%" PRId32 ",\"grr\":%" PRId32 "%s",
          s->hp,s->inj,s->ws,s->w,s->clip,s->res,s->cap,s->gr,s->grr,extra);
@@ -928,21 +936,24 @@ static void publish_state(uint64_t now) {
     send=gs_have_player && state_due(&s,now);
     if (send) { gs_sent=s; gs_valid=1; gs_sent_us=now; }
     pthread_mutex_unlock(&state_lock);
-    if (send) send_state(&s,0,0,0);
+    if (send) send_state(&s,0,0,0,0,0);
 }
 static void game_state_refresh(uint64_t now) {
     if (!atomic_load_explicit(&state_enabled,memory_order_relaxed)) return;
     const uint64_t players=atomic_load_explicit(&gs_player_calls,memory_order_relaxed);
     const uint64_t controllers=atomic_load_explicit(&gs_controller_calls,memory_order_relaxed);
-    const uint64_t ups=players-gs_player_refresh, wps=controllers-gs_controller_refresh;
-    gs_player_refresh=players; gs_controller_refresh=controllers;
-    if (!players && !controllers) return; /* nothing seen yet (menus, or another version) */
+    const uint64_t controls=atomic_load_explicit(&gs_control_calls,memory_order_relaxed);
+    const uint64_t frames=atomic_load_explicit(&gs_frame_calls,memory_order_relaxed);
+    const uint64_t ups=players-gs_player_refresh, wps=controllers-gs_controller_refresh, upc=controls-gs_control_refresh,
+                   upf=frames-gs_frame_refresh;
+    gs_player_refresh=players; gs_controller_refresh=controllers; gs_control_refresh=controls; gs_frame_refresh=frames;
+    if (!players && !controllers && !frames) return; /* nothing seen yet (menus, or another version) */
     GameState s;
     pthread_mutex_lock(&state_lock);
     compose(&s,now);
     gs_sent=s; gs_valid=1; gs_sent_us=now;
     pthread_mutex_unlock(&state_lock);
-    send_state(&s,1,ups,wps);
+    send_state(&s,1,ups,wps,upc,upf);
 }
 static void game_state_counters(char *out, size_t size) {
     out[0]=0;
@@ -1071,26 +1082,237 @@ static const RuntimeGuestCallback u1_state_callbacks[]={
       26, 6, state_damage, NULL},
 };
 
+/* ------------------------------------------------------------------------------------------
+ * U2 (big2-ps4_Shipping.elf of CUSA02320 1.02, sha256 c049a945...a1383b4ee8; image offsets)
+ * [VERIFICADO by disassembly of that executable; each pattern below matches once in its
+ * executable segments and none in U1 1.02]. The player's class (vtable 0x1010980) has its
+ * EventHandler at +0x38 (0x7edd80: the port's health cheat jumps at 0x7f0143) and a per-frame
+ * update at +0x100 (0x9717b0).
+ *   0x971b64  in that update, right after HealthSystem::GetHealthFraction: r15 = the player,
+ *             xmm0 = health / maximum, clamped to 0..1 (the value the game hands to
+ *             [player+0x28f0]+0x28; the "Enable health effect test" option sets the health just
+ *             below). +0x1f0: the HealthSystem (vtable 0x103f200; +0x48 GetHealth regenerates from
+ *             +0x2c, the health after the last hit, its frame +0x20, delay +0x24 and rate +0x28,
+ *             up to the maximum at +0x30). +0x2768: the WeaponController (the EventHandler and
+ *             0x7172c2 use it; its +0x128 is the player). Locators (get-object-position 0xa12390):
+ *             the parent's at +0xf0 (position) / +0x100 (rotation x y z w), the object's own
+ *             relative to it at +0x110 / +0x120; the world one is parent * own (the parent is the
+ *             identity off moving platforms) [VERIFICADO 2026-10-27: +0xf0 alone was 0 in 99 %
+ *             of the hits].
+ *   WeaponController (Fire 0x9614a0): current slot byte at +0x208, handles at +0x130, 16 bytes
+ *             each (slot pointer, u32 id at +8; valid when (*slot)+0x44 == id, as Fire checks).
+ *             +0x128: the owner.
+ *   weapon    +0x550: u32 weapon type string id (Fire compares it; 0xff5403e6 is in U1 too).
+ *             Ammunition per fire mode, 32 bytes at +0x620: i16 clip (ConsumeRound 0xaea020:
+ *             dec word [w+mode*32+0x620]), i16 reserve at +0x622 (Reload 0xae9430 moves it into
+ *             the clip), i16 clip size at +0x624 (0xae4570 sets it from the weapon's settings).
+ *   0x714a70  a helper the player's controllers call (66 call sites; rdi+8 = the player): its
+ *             calls go out as upc and, by default, as ups [HIPÓTESIS: like U1's player update,
+ *             none during cutscenes, while the frame hook (upf) runs in them too];
+ *             UNDS_U2_UPS=frame makes ups the frames instead.
+ *   0x961ac3  WeaponController::Fire: xor esi, esi; mov rdi, r14; call ConsumeRound (the port's
+ *             ammo cheat NOPs that call at 0x961ac8): r14 = the weapon, r12 = the controller.
+ *   0x7f06dc  the EventHandler applies damage (past the god-mode checks): r12 = HealthSystem,
+ *             r13 = the damage (+0x24 i32 amount in health points, +8 source handle: pointer,
+ *             u32 id at +0x10, valid when (*pointer)+0x44 == id), r15 = the player.
+ * Grenades are not mapped yet (gr -1). */
+#define U2_HEALTH_SYSTEM 0x1f0
+#define U2_HEALTH_MAX 0x30
+#define U2_CONTROLLER 0x2768
+#define U2_LOCATOR 0xf0          /* parent position, rotation; own position, rotation: 4 vec4 */
+#define U2_CONTROLLER_SLOT 0x208
+#define U2_CONTROLLER_HANDLES 0x130
+#define U2_CONTROLLER_OWNER 0x128
+#define U2_HANDLES 8
+#define U2_PROCESS_ID 0x44
+#define U2_WEAPON_TYPE 0x550
+#define U2_WEAPON_AMMO 0x620
+#define U2_DAMAGE_AMOUNT 0x24
+#define U2_DAMAGE_SOURCE 0x8
+
+
+/* The world locator {x y z w, qx qy qz qw} of a U2 object: parent * own (get-object-position). */
+static int u2_world_locator(uintptr_t object, float out[8]) {
+    float l[16];
+    if (!peek(object+U2_LOCATOR,l,sizeof(l))) return 0;
+    const float *pp=l, *pq=l+4, *lp=l+8, *lq=l+12;
+    /* v' = v + 2w (q x v) + 2 q x (q x v) */
+    const float tx=2.0f*(pq[1]*lp[2]-pq[2]*lp[1]), ty=2.0f*(pq[2]*lp[0]-pq[0]*lp[2]), tz=2.0f*(pq[0]*lp[1]-pq[1]*lp[0]);
+    out[0]=pp[0]+lp[0]+pq[3]*tx+(pq[1]*tz-pq[2]*ty);
+    out[1]=pp[1]+lp[1]+pq[3]*ty+(pq[2]*tx-pq[0]*tz);
+    out[2]=pp[2]+lp[2]+pq[3]*tz+(pq[0]*ty-pq[1]*tx);
+    out[3]=1.0f;
+    out[4]=pq[3]*lq[0]+pq[0]*lq[3]+pq[1]*lq[2]-pq[2]*lq[1];
+    out[5]=pq[3]*lq[1]-pq[0]*lq[2]+pq[1]*lq[3]+pq[2]*lq[0];
+    out[6]=pq[3]*lq[2]+pq[0]*lq[1]-pq[1]*lq[0]+pq[2]*lq[3];
+    out[7]=pq[3]*lq[3]-pq[0]*lq[0]-pq[1]*lq[1]-pq[2]*lq[2];
+    return 1;
+}
+/* {pointer to a slot, u32 id at +8}: the process in the slot while its id is still `id`. */
+static uintptr_t u2_process(uintptr_t handle) {
+    uint64_t pointer=0, process=0; uint32_t id=0, check=0;
+    if (!peek(handle,&pointer,8) || !peek(handle+8,&id,4) || !pointer || !id ||
+        !peek((uintptr_t)pointer,&process,8) || !process ||
+        !peek((uintptr_t)process+U2_PROCESS_ID,&check,4) || check!=id) return 0;
+    return (uintptr_t)process;
+}
+static void u2_read_weapon(uintptr_t controller, WeaponState *w) {
+    w->ws=-1; w->w=0; w->clip=w->res=w->cap=-1; w->gr=w->grr=-1;
+    uint8_t slot=0;
+    if (!peek(controller+U2_CONTROLLER_SLOT,&slot,1) || slot>=U2_HANDLES) return;
+    const uintptr_t weapon=u2_process(controller+U2_CONTROLLER_HANDLES+16u*slot);
+    int16_t ammo[3]; uint32_t type;
+    if (weapon && peek(weapon+U2_WEAPON_TYPE,&type,4) && peek(weapon+U2_WEAPON_AMMO,ammo,sizeof(ammo))) {
+        w->ws=slot; w->w=type; w->clip=ammo[0]; w->res=ammo[1]; w->cap=ammo[2];
+    }
+}
+/* The player's controller, or 0 if [player+0x2768] is not a controller of the player. */
+static uintptr_t u2_controller(uintptr_t player) {
+    uint64_t controller=0, owner=0;
+    if (!peek(player+U2_CONTROLLER,&controller,8) || !controller ||
+        !peek((uintptr_t)controller+U2_CONTROLLER_OWNER,&owner,8) || owner!=player) return 0;
+    return (uintptr_t)controller;
+}
+/* Once a frame: r15 = the player, xmm0 = its health fraction. */
+static void __attribute__((ms_abi)) state_u2_frame(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
+                                                    const RuntimeGuestRegs *regs) {
+    (void)rdi; (void)rsi; (void)r14;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !regs || !regs->r15) return;
+    const uintptr_t player=(uintptr_t)regs->r15;
+    const float fraction=runtime_guest_xmm(regs,0)[0];
+    atomic_fetch_add_explicit(&gs_frame_calls,1,memory_order_relaxed);
+    if (!atomic_load_explicit(&ups_from_control,memory_order_relaxed))
+        atomic_fetch_add_explicit(&gs_player_calls,1,memory_order_relaxed);
+    if (atomic_exchange_explicit(&gs_player,player,memory_order_relaxed)!=player) {
+        state_log("U2 player object %#" PRIxPTR " (image %#" PRIx64 "), health %.3f\n",player,image,(double)fraction);
+        pthread_mutex_lock(&state_lock);
+        gs_valid=0; /* a new player (level load): the next state goes out at once */
+        pthread_mutex_unlock(&state_lock);
+    }
+    WeaponState w;
+    const uintptr_t controller=u2_controller(player);
+    if (controller) {
+        atomic_fetch_add_explicit(&gs_controller_calls,1,memory_order_relaxed);
+        if (atomic_exchange_explicit(&gs_controller,controller,memory_order_relaxed)!=controller)
+            state_log("U2 weapon controller %#" PRIxPTR "\n",controller);
+        u2_read_weapon(controller,&w);
+    } else {
+        w.ws=-1; w.w=0; w.clip=w.res=w.cap=-1; w.gr=w.grr=-1;
+    }
+    const uint64_t now=now_us();
+    w.us=now;
+    pthread_mutex_lock(&state_lock);
+    gs_hp=health_milli(fraction); gs_inj=0; gs_have_player=1; gs_weapon=w;
+    pthread_mutex_unlock(&state_lock);
+    publish_state(now);
+}
+/* rdi+8 = the player when one of the player's controllers runs. */
+static void __attribute__((ms_abi)) state_u2_control(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
+                                                      const RuntimeGuestRegs *regs) {
+    (void)rsi; (void)image; (void)r14; (void)regs;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !rdi) return;
+    uint64_t object=0;
+    const uintptr_t player=atomic_load_explicit(&gs_player,memory_order_relaxed);
+    if (player && peek((uintptr_t)rdi+8,&object,8) && (uintptr_t)object==player) {
+        atomic_fetch_add_explicit(&gs_control_calls,1,memory_order_relaxed);
+        if (atomic_load_explicit(&ups_from_control,memory_order_relaxed))
+            atomic_fetch_add_explicit(&gs_player_calls,1,memory_order_relaxed);
+    }
+}
+/* r14 = the weapon Fire takes a round from, r12 = its controller (the player's only). */
+static void __attribute__((ms_abi)) state_u2_shot(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t weapon,
+                                                   const RuntimeGuestRegs *regs) {
+    (void)rdi; (void)rsi; (void)image;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !weapon || !regs) return;
+    const uintptr_t player=atomic_load_explicit(&gs_player,memory_order_relaxed);
+    uint64_t owner=0;
+    if (!player || !peek((uintptr_t)regs->r12+U2_CONTROLLER_OWNER,&owner,8) || (uintptr_t)owner!=player) return;
+    uint32_t type=0; int16_t ammo[3]={-1,-1,-1};
+    if (!peek((uintptr_t)weapon+U2_WEAPON_TYPE,&type,4) || !peek((uintptr_t)weapon+U2_WEAPON_AMMO,ammo,sizeof(ammo))) return;
+    atomic_fetch_add_explicit(&gs_shots,1,memory_order_relaxed);
+    emit("shot",",\"w\":\"0x%" PRIx32 "\",\"clip\":%d,\"res\":%d,\"cap\":%d",type,ammo[0],ammo[1],ammo[2]);
+}
+/* r15 = the player, r13 = the damage, r12 = the player's HealthSystem. */
+static void __attribute__((ms_abi)) state_u2_damage(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
+                                                     const RuntimeGuestRegs *regs) {
+    (void)rdi; (void)rsi; (void)image; (void)r14;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !regs || !regs->r15 || !regs->r13) return;
+    const uintptr_t player=(uintptr_t)regs->r15, damage=(uintptr_t)regs->r13, health=(uintptr_t)regs->r12;
+    if (player!=atomic_load_explicit(&gs_player,memory_order_relaxed)) return;
+    int32_t amount=0, maximum=0; uint32_t type=0;
+    if (!peek(damage+U2_DAMAGE_AMOUNT,&amount,4)) return;
+    peek(damage,&type,4);
+    const long milli=peek(health+U2_HEALTH_MAX,&maximum,4) && maximum>0 ? lround(1000.0*(double)amount/(double)maximum) : -1;
+    atomic_fetch_add_explicit(&gs_damages,1,memory_order_relaxed);
+    float loc[8]={0,0,0,0,0,0,0,1}, src[8]={0,0,0,0,0,0,0,1};
+    const int have_loc=u2_world_locator(player,loc);
+    const uintptr_t source=u2_process(damage+U2_DAMAGE_SOURCE);
+    const int have_src=source && u2_world_locator(source,src);
+    pthread_mutex_lock(&state_lock);
+    const int32_t hp=gs_hp;
+    pthread_mutex_unlock(&state_lock);
+    emit("dmg",",\"ty\":%" PRIu32 ",\"amt\":%ld,\"hp\":%" PRId32 ",\"src\":%d,\"sx\":%ld,\"sy\":%ld,\"sz\":%ld,"
+         "\"loc\":%d,\"px\":%ld,\"py\":%ld,\"pz\":%ld,\"qx\":%ld,\"qy\":%ld,\"qz\":%ld,\"qw\":%ld,\"hpt\":%" PRId32,
+         type,milli,hp,have_src,scaled(src[0],1000.0f),scaled(src[1],1000.0f),scaled(src[2],1000.0f),
+         have_loc,scaled(loc[0],1000.0f),scaled(loc[1],1000.0f),scaled(loc[2],1000.0f),
+         scaled(loc[4],10000.0f),scaled(loc[5],10000.0f),scaled(loc[6],10000.0f),scaled(loc[7],10000.0f),amount);
+}
+static const RuntimeGuestCallback u2_state_callbacks[]={
+    /* 0x971b64 (pattern at 0x971b3a): mov rdi, [r15+0x1f0]; call [vtable+0x80] (health fraction);
+     * clamp to 0..1; here: mov rdi, [r15+0x28f0]; ... */
+    {"UNDS U2 player frame (state)",
+      "49 8b bf f0 01 00 00 48 8b 07 ff 90 80 00 00 00 c5 f8 28 c8 c5 fa 10 05 ?? ?? ?? ?? c5 f8 2e c8 77 ?? "
+      "c5 f8 57 c0 c5 f2 5f c0 49 8b bf f0 28 00 00 48 8b 07 ff 50 28 4c 89 ff e8 ?? ?? ?? ?? 4c 89 ff "
+      "e8 ?? ?? ?? ?? 4c 89 ff e8 ?? ?? ?? ?? 4c 89 ff e8 ?? ?? ?? ?? 41 f6 87 5d 2c 00 00 02 74 ??",
+      42, 7, state_u2_frame, NULL},
+    /* 0x714a70: push rbp; mov rbp, rsp; push r15 ...; sub rsp, 0x4b8; mov r14, rdi; ...; mov rsi, [r14+8];
+     * cmp byte [rsi+0x3e4], 0 */
+    {"UNDS U2 player control (state)",
+      "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec b8 04 00 00 49 89 fe 48 8b 05 ?? ?? ?? ?? 48 8b 00 "
+      "48 89 45 d0 49 8b 76 08 80 be e4 03 00 00 00 0f 84 ?? ?? ?? ?? 48 8d 05 ?? ?? ?? ?? 8a 00 84 c0 "
+      "0f 85 ?? ?? ?? ??",
+      0, 6, state_u2_control, NULL},
+    /* 0x961ac3 (pattern at 0x961a96): Fire, mov esi, 0xb0f18f64; call; cmp [r14+0x30], 0xc3792632; ...;
+     * xor esi, esi; mov rdi, r14; call ConsumeRound (or the ammo cheat's NOPs) */
+    {"UNDS U2 player shot (state)",
+      "be 64 8f f1 b0 e8 ?? ?? ?? ?? 41 81 7e 30 32 26 79 c3 75 ?? 48 8d 05 ?? ?? ?? ?? 83 b8 a4 48 00 00 00 "
+      "75 ?? 83 3d ?? ?? ?? ?? 02 7c ?? 31 f6 4c 89 f7 ?? ?? ?? ?? ?? 31 f6 4c 89 f7 e8 ?? ?? ?? ?? 84 c0",
+      45, 5, state_u2_shot, NULL},
+    /* 0x7f06dc (pattern at 0x7f06b9): EventHandler, mov rax, [r12]; mov esi, [r13+0x24]; mov rdi, r12;
+     * call [rax+8] (TakeDamage) */
+    {"UNDS U2 player damage (state)",
+      "49 8b 07 49 8b 4f 70 48 8b 80 e8 01 00 00 8b 49 0c 89 8d 00 5a ff ff 48 8d b5 00 5a ff ff 4c 89 ff "
+      "ff d0 49 8b 04 24 41 8b 75 24 4c 89 e7 ff 50 08 48 8d 05 ?? ?? ?? ?? 80 38 00 74 ?? 8b 05 ?? ?? ?? ?? "
+      "83 f8 02 7c ?? 48 8d 0d ?? ?? ?? ?? 8a 89 7c 49 00 00 84 c9 75 ??",
+      35, 8, state_u2_damage, NULL},
+};
+
 const RuntimeGuestCallback *runtime_unds_guest_callbacks(size_t *count) {
     *count=0;
     const char *events=getenv("UNDS_EVENTS"), *state=getenv("UNDS_STATE"), *debug=getenv("UNDS_STATE_DEBUG");
     if (!events || !*events || (state && !strcmp(state,"0"))) return u1_state_callbacks;
     exe_names();
-    if (strcmp(exe_id,"u1")) return u1_state_callbacks; /* U2 and U3: not mapped yet */
+    const RuntimeGuestCallback *table=NULL;
+    if (!strcmp(exe_id,"u1")) { table=u1_state_callbacks; *count=sizeof(u1_state_callbacks)/sizeof(*u1_state_callbacks); }
+    else if (!strcmp(exe_id,"u2")) { table=u2_state_callbacks; *count=sizeof(u2_state_callbacks)/sizeof(*u2_state_callbacks); }
+    else return u1_state_callbacks; /* U3: not mapped yet */
     offsets=&u1_100;
-    *count=sizeof(u1_state_callbacks)/sizeof(*u1_state_callbacks);
+    atomic_store(&control_enabled,table==u2_state_callbacks);
+    const char *u2_ups=getenv("UNDS_U2_UPS");
+    atomic_store(&ups_from_control,!(u2_ups && !strcmp(u2_ups,"frame")));
     atomic_store(&state_enabled,1);
     atomic_store(&state_debug,debug && !strcmp(debug,"1"));
-    return u1_state_callbacks;
+    return table;
 }
 
 void runtime_unds_report(void) {
     if (!atomic_load(&configured)) return;
     if (atomic_load(&state_enabled))
         printf("Runtime: UNDS state: player updates=%" PRIu64 ", weapon controller updates=%" PRIu64 " (other objects %" PRIu64
-               "), shots=%" PRIu64 ", damage=%" PRIu64 ", failed reads=%" PRIu64 "\n",
+               "), U2 frames=%" PRIu64 " controls=%" PRIu64 ", shots=%" PRIu64 ", damage=%" PRIu64 ", failed reads=%" PRIu64 "\n",
                atomic_load(&gs_player_calls),atomic_load(&gs_controller_calls),atomic_load(&gs_controller_foreign),
-               atomic_load(&gs_shots),atomic_load(&gs_damages),atomic_load(&gs_peek_failures));
+               atomic_load(&gs_frame_calls),atomic_load(&gs_control_calls),atomic_load(&gs_shots),atomic_load(&gs_damages),
+               atomic_load(&gs_peek_failures));
     printf("Runtime: UNDS events sent=%" PRIu64 ", dropped=%" PRIu64 ", errors=%" PRIu64 " (last %d), "
            "longest sendto %" PRIu64 " us, sends over 1 ms=%" PRIu64 ", scePadSetVibration calls=%" PRIu64 "\n",
            atomic_load(&sent),atomic_load(&dropped),atomic_load(&errors),atomic_load(&last_error),

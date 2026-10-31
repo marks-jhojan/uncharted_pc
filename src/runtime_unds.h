@@ -40,7 +40,7 @@
 #include <stdint.h>
 
 #define UNDS_PROTOCOL 1
-#define UNDS_VERSION "0.5.0"
+#define UNDS_VERSION "0.6.0"
 
 /* Control datagram (see above). */
 #define UNDS_FX_SIZE 37

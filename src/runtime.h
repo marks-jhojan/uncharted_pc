@@ -111,6 +111,13 @@ void runtime_fiber_report(void);
 typedef struct {
     uint64_t r15, r13, r12, rbx, r11, r10, r9, r8, rdx, rcx, rax, rflags;
 } RuntimeGuestRegs;
+/* xmm0-xmm7 as the thunk saved them (probe.c install_game_callbacks): below the RuntimeGuestRegs
+ * block it aligns rsp to 16, reserves 0xb0 bytes and stores xmmN at rsp+0x30+16*N. Valid during
+ * the callback; four floats each. */
+static inline const float *runtime_guest_xmm(const RuntimeGuestRegs *regs, int n) {
+    const uintptr_t below=((uintptr_t)regs&~(uintptr_t)15)-0xb0u;
+    return (const float *)(below+0x30u+16u*(unsigned)n);
+}
 typedef struct {
     const char *name;
     const char *pattern;
