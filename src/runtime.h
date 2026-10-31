@@ -120,4 +120,6 @@ typedef struct {
     const unsigned char *patch;
 } RuntimeGuestCallback;
 const RuntimeGuestCallback *runtime_guest_callbacks(size_t *count);
+/* UNDS game-state callbacks (runtime_unds.c): none unless UNDS_EVENTS is set (and UNDS_STATE is not 0). */
+const RuntimeGuestCallback *runtime_unds_guest_callbacks(size_t *count);
 #endif

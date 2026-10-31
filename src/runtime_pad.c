@@ -832,9 +832,17 @@ static const RuntimeGuestCallback guest_callbacks[]={
       14, 7, ndgi_end, NULL},
 
 };
+/* The port's callbacks, then the UNDS game-state ones (none without UNDS_EVENTS). */
 const RuntimeGuestCallback *runtime_guest_callbacks(size_t *count) {
-    *count=sizeof(guest_callbacks)/sizeof(*guest_callbacks);
-    return guest_callbacks;
+    enum { OWN=sizeof(guest_callbacks)/sizeof(*guest_callbacks), UNDS_MAX=16 };
+    static RuntimeGuestCallback all[OWN+UNDS_MAX];
+    size_t extra=0;
+    const RuntimeGuestCallback *unds=runtime_unds_guest_callbacks(&extra);
+    if (extra>UNDS_MAX) extra=UNDS_MAX;
+    memcpy(all,guest_callbacks,sizeof(guest_callbacks));
+    if (extra) memcpy(all+OWN,unds,extra*sizeof(*unds));
+    *count=OWN+extra;
+    return all;
 }
 
 /* The button pictures for this controller: 1 PlayStation (DualShock, DualSense: the game's own),

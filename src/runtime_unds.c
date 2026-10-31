@@ -33,7 +33,17 @@
  *          levels x10000 of full scale over the window: rms of L/R (8 channels folded like the
  *          stereo output: centre and surrounds at -3 dB, LFE dropped), peak |L|,|R|, and rms
  *          of (L+R)/2 low-passed at 150 Hz (one pole). Digital silence (pk 0) is sent once and
- *          then refreshed every 1 s instead of every window. */
+ *          then refreshed every 1 s instead of every window.
+ *   gs     game state (UNDS_STATE, see the "Game state" section; U1 1.00 only so far):
+ *          hp (player health x1000, 0-1000; -1 unknown) inj (1 injured) ws (weapon controller
+ *          slot index, -1 none) w ("0x..." weapon type string id, "0x0" none) clip res cap (rounds
+ *          in the clip, in reserve, clip size; -1 without a weapon) gr (grenades, -1 unknown);
+ *          refreshes (re:1, every 0.5 s) add ups/wps (player / weapon controller updates in the
+ *          last 0.5 s: 0 while the game does not run the player, e.g. cutscenes [HIPÓTESIS])
+ *   shot   w clip (before this round) res cap: the player's weapon fired one round
+ *   dmg    ty (damage type) amt hp (x1000, health before) src(1 with a source) sx sy sz
+ *          (source position, mm) px py pz (player position, mm) qx qy qz qw (player rotation
+ *          x10000) */
 #define _GNU_SOURCE
 #ifdef _WIN32
 #include <winsock2.h>
@@ -58,6 +68,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/uio.h>
 typedef int unds_socket_t;
 #define UNDS_INVALID_SOCKET (-1)
 #else
@@ -105,6 +116,9 @@ typedef struct {
     float peak, lp;
 } AudioAcc;
 static AudioAcc audio_acc[UNDS_PORTS];
+
+static void game_state_refresh(uint64_t now);
+static void game_state_counters(char *out, size_t size);
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
 static uint64_t now_us(void) { return now_ns()/1000u; }
@@ -221,21 +235,22 @@ static void ports_text(char *out, size_t size) {
     }
 }
 static void send_hello(int boot) {
-    char ports[256];
+    char ports[256], state[128];
     pthread_mutex_lock(&state_lock);
     ports_text(ports,sizeof(ports));
     pthread_mutex_unlock(&state_lock);
+    game_state_counters(state,sizeof(state));
     const uint64_t smax=atomic_exchange_explicit(&send_max_ns,0,memory_order_relaxed);
     emit("hello",",\"boot\":%d,\"exe\":\"%s\",\"bin\":\"%s\",\"pid\":%lu,\"base\":\"0x%" PRIxPTR "\",\"ver\":\"%s\","
          "\"up\":%" PRIu64 ",\"rumble\":%d,\"led\":%d,\"trig\":\"%d,%d\",\"sent\":%" PRIu64 ",\"drop\":%" PRIu64 ",\"err\":%" PRIu64 ","
-         "\"smax\":%" PRIu64 ",\"vib\":%" PRIu64 ",\"ports\":\"%s\"",
+         "\"smax\":%" PRIu64 ",\"vib\":%" PRIu64 ",\"ports\":\"%s\"%s",
          boot,exe_id,exe_file,process_id,image_base,UNDS_VERSION,(now_us()-start_us)/1000u,
          atomic_load_explicit(&rumble_on,memory_order_relaxed),atomic_load_explicit(&led_on,memory_order_relaxed),
          atomic_load_explicit(&trigger_threshold[0],memory_order_relaxed),
          atomic_load_explicit(&trigger_threshold[1],memory_order_relaxed),
          atomic_load_explicit(&sent,memory_order_relaxed),atomic_load_explicit(&dropped,memory_order_relaxed),
          atomic_load_explicit(&errors,memory_order_relaxed),smax/1000u,
-         atomic_load_explicit(&vibration_calls,memory_order_relaxed),ports);
+         atomic_load_explicit(&vibration_calls,memory_order_relaxed),ports,state);
 }
 
 static void send_pad(const PadState *s) {
@@ -275,6 +290,7 @@ static void *heartbeat(void *argument) {
         pthread_mutex_unlock(&state_lock);
         if (have_pad) send_pad(&pad);
         if (!(tick%4)) send_hello(0);
+        if (!(tick%2)) game_state_refresh(now);
         if (refresh_rumble) emit("rumble",",\"l\":%u,\"s\":%u,\"re\":1",l,s);
         if (refresh_led) emit("led",",\"r\":%u,\"g\":%u,\"b\":%u,\"re\":1",rgb[0],rgb[1],rgb[2]);
         const uint64_t failures=atomic_load_explicit(&errors,memory_order_relaxed)+atomic_load_explicit(&dropped,memory_order_relaxed);
@@ -507,8 +523,341 @@ void runtime_unds_audio(int port, int type, const void *pcm, int frames, int cha
     }
 }
 
+/* ------------------------------------------------------------------------------------------
+ * Game state (UNDS_STATE). Callbacks in the game's own code (probe.c install_game_callbacks,
+ * through runtime_guest_callbacks) read the player's health, weapon and ammunition where the game
+ * itself uses them. They are handed to the loader only for U1 (BB_EXE), with UNDS_EVENTS set and
+ * UNDS_STATE not "0". The loader finds each site by its instruction pattern (RIP-relative
+ * displacements and call targets are wildcards), which must match exactly once; a build without
+ * that code gets 'Callbacks: UNDS U1 ... not found' and nothing is installed.
+ *
+ * U1 1.00 (CUSA02320 eboot.bin, sha256 74cf17ba...a5c424; image offsets) [VERIFICADO by
+ * disassembly of that executable; each pattern below matches once in its executable segment
+ * and in the linked image, and none in U2 1.00]. U1 1.02 is the same code with other
+ * displacements (port 0.3.7+, scripts/cheats.py: the GoldHEN health jump and the ConsumeRound
+ * call at 0x26244b / 0x730f73 in 1.02, 0x261edb / 0x71b003 here) [HIPÓTESIS: the same
+ * patterns match 1.02 once; check 'Callbacks: UNDS U1 ...' in the log of a 1.02 run]:
+ *   0x2645f0  player update (oldplayer.cpp; rdi = the player; its callers include the death
+ *             controller). Health: float at +0x1428, 0..1. The debug option "Enable health
+ *             effect test (overrides player health)" writes 0.505 + 0.495 sin(t) there,
+ *             regeneration adds to it and clamps it at 1.0, the death path writes 0 and the
+ *             damage branch subtracts the damage. +0x1430: byte, health below the "injured"
+ *             threshold. +0xf0: the locator (+0x10 position, +0x20 rotation quaternion).
+ *   0x71e920  WeaponController::PostJointUpdate (weaponcontroller.cpp; rdi = the controller).
+ *             m_currentWeapon: u32 at +0x198. m_weaponHandles[6] at +0x130, 16 bytes each:
+ *             slot pointer, u32 id at +8; valid when (*slot)+0x64 == id (WeaponController::Fire
+ *             checks exactly this). kGrenade = 4 (PostJointUpdate's assertion). +0x128:
+ *             m_pGameObject (Fire: ->m_pNpc->GetWeaponInventory()).
+ *   weapon    +0x2e4: u32 weapon type string id (GetWeaponSettings looks it up). +0x440:
+ *             rounds in the clip (ConsumeRound: dec dword [w+0x440] for fire mode 0), +0x444:
+ *             reserve, +0x448: clip size (Reload moves min(size - clip, reserve)). GoldHEN's
+ *             1.02 "No Reload" / "Inf Ammo" cheats patch the same two instructions (0x346469 /
+ *             0x345e98 in 1.02; 0x345cf9 / 0x345728 here).
+ *   0x71affe  WeaponController::Fire, right before ConsumeRound(weapon, 0): r14 = the weapon.
+ *   0x261eea  Player::EventHandler (oldplayer.cpp), damage branch: health -= [r15+0x14];
+ *             r14 = player, r15 = the damage (+0 u32 type, +8 source object or 0, +0x14
+ *             amount). For its hit direction the handler takes the player's position minus
+ *             the source's +0x10 vec4 [HIPÓTESIS: that vec4 is the source's position].
+ * The callbacks run on the game's threads: they read a few fields, compare and send, without
+ * any lock of the game. Pointers kept between calls (the controller's weapon handles) are read
+ * through peek(), which fails instead of faulting on memory that is gone. */
+#define GS_HP_STEP 5                 /* x1000: smaller health changes wait for GS_SLOW_US */
+#define GS_SLOW_US 100000u
+#define GS_WEAPON_STALE_US 500000u   /* no controller update for this long: no weapon */
+#define GS_DEBUG_LINES 24
+
+typedef struct {
+    uint32_t health, injured, locator, controller_current, controller_handles, controller_owner,
+             handle_id, weapon_type, weapon_ammo, damage_type, damage_source, damage_amount, source_position;
+    int handles, grenade_slot;
+} GameOffsets;
+static const GameOffsets u1_100={
+    .health=0x1428, .injured=0x1430, .locator=0xf0,
+    .controller_current=0x198, .controller_handles=0x130, .controller_owner=0x128,
+    .handle_id=0x64, .weapon_type=0x2e4, .weapon_ammo=0x440,
+    .damage_type=0x0, .damage_source=0x8, .damage_amount=0x14, .source_position=0x10,
+    .handles=6, .grenade_slot=4,
+};
+static const GameOffsets *offsets=&u1_100;
+
+typedef struct { int32_t hp, inj, ws, clip, res, cap, gr, grr; uint32_t w; } GameState;
+typedef struct { int32_t ws, clip, res, cap, gr, grr; uint32_t w; uint64_t us; } WeaponState;
+static _Atomic int state_enabled, state_debug, state_debug_lines, owner_confirmed;
+static _Atomic uintptr_t gs_player, gs_controller;
+static _Atomic uint64_t gs_player_calls, gs_controller_calls, gs_controller_foreign, gs_shots, gs_damages, gs_peek_failures;
+static uint64_t gs_player_refresh, gs_controller_refresh; /* heartbeat thread only */
+/* under state_lock */
+static WeaponState gs_weapon;
+static GameState gs_sent;
+static int gs_valid, gs_have_player;
+static int32_t gs_hp=-1, gs_inj;
+static uint64_t gs_sent_us;
+
+/* Reads `size` bytes at `address` of this process; 0 (counted) where nothing is mapped. */
+static int peek(uintptr_t address, void *out, size_t size) {
+    if (address<0x10000 || address+size<address) return 0;
+#ifdef _WIN32
+    SIZE_T got=0;
+    if (ReadProcessMemory(GetCurrentProcess(),(LPCVOID)address,out,size,&got) && got==size) return 1;
+#else
+    struct iovec local={out,size}, remote={(void *)address,size};
+    if (process_vm_readv(getpid(),&local,1,&remote,1,0)==(ssize_t)size) return 1;
+#endif
+    atomic_fetch_add_explicit(&gs_peek_failures,1,memory_order_relaxed);
+    return 0;
+}
+static float load_float(uintptr_t address) { float v; memcpy(&v,(const void *)address,4); return v; }
+static uint32_t load_u32(uintptr_t address) { uint32_t v; memcpy(&v,(const void *)address,4); return v; }
+static uint64_t load_u64(uintptr_t address) { uint64_t v; memcpy(&v,(const void *)address,8); return v; }
+/* Health 0..1 as 0-1000; -1 when the value cannot be a health (a wrong object or version). */
+static int32_t health_milli(float h) {
+    if (!(h==h) || h<-0.01f || h>1.5f) return -1;
+    if (h<=0.0f) return 0;
+    const int32_t v=(int32_t)(h*1000.0f+0.5f);
+    return v>1000 ? 1000 : v;
+}
+/* float * scale as an integer for the JSON (no locale), 0 for NaN, clamped. */
+static long scaled(float v, float scale) {
+    if (!(v==v)) return 0;
+    const double x=(double)v*(double)scale;
+    if (x>2.0e9) return 2000000000L;
+    if (x<-2.0e9) return -2000000000L;
+    return lround(x);
+}
+__attribute__((format(printf,1,2)))
+static void state_log(const char *format, ...) {
+    if (!atomic_load_explicit(&state_debug,memory_order_relaxed)) return;
+    if (atomic_fetch_add_explicit(&state_debug_lines,1,memory_order_relaxed)>=GS_DEBUG_LINES) return;
+    va_list args;
+    va_start(args,format);
+    fputs("Runtime: UNDS: state: ",stdout);
+    vprintf(format,args);
+    va_end(args);
+    fflush(stdout);
+}
+
+/* The process a weapon controller handle points to, as WeaponController::Fire checks it; 0 if
+ * the handle is empty or stale. `controller` is valid (the game is updating it). */
+static uintptr_t handle_target(uintptr_t controller, int slot) {
+    const GameOffsets *o=offsets;
+    if (slot<0 || slot>=o->handles) return 0;
+    const uintptr_t handle=controller+o->controller_handles+16u*(unsigned)slot;
+    const uint64_t pointer=load_u64(handle);
+    const uint32_t id=load_u32(handle+8);
+    uint64_t process=0; uint32_t check=0;
+    if (!pointer || !id || !peek((uintptr_t)pointer,&process,8) || !process ||
+        !peek((uintptr_t)process+o->handle_id,&check,4) || check!=id) return 0;
+    return (uintptr_t)process;
+}
+static void read_weapon(uintptr_t controller, WeaponState *w) {
+    const GameOffsets *o=offsets;
+    w->ws=-1; w->w=0; w->clip=w->res=w->cap=-1; w->gr=w->grr=-1;
+    const int32_t current=(int32_t)load_u32(controller+o->controller_current);
+    const uintptr_t weapon=handle_target(controller,current);
+    int32_t ammo[3]; uint32_t type;
+    if (weapon && peek(weapon+o->weapon_type,&type,4) && peek(weapon+o->weapon_ammo,ammo,sizeof(ammo))) {
+        w->ws=current; w->w=type; w->clip=ammo[0]; w->res=ammo[1]; w->cap=ammo[2];
+    }
+    const uintptr_t grenade=handle_target(controller,o->grenade_slot);
+    if (grenade && peek(grenade+o->weapon_ammo,ammo,8)) { w->gr=ammo[0]; w->grr=ammo[1]; }
+}
+static void compose(GameState *s, uint64_t now) { /* state_lock held */
+    s->hp=gs_hp; s->inj=gs_inj;
+    if (gs_weapon.us && now-gs_weapon.us<GS_WEAPON_STALE_US) {
+        s->ws=gs_weapon.ws; s->w=gs_weapon.w; s->clip=gs_weapon.clip; s->res=gs_weapon.res; s->cap=gs_weapon.cap;
+        s->gr=gs_weapon.gr; s->grr=gs_weapon.grr;
+    } else { s->ws=-1; s->w=0; s->clip=s->res=s->cap=-1; s->gr=s->grr=-1; }
+}
+static int state_differs(const GameState *a, const GameState *b) {
+    return a->inj!=b->inj || a->ws!=b->ws || a->w!=b->w || a->clip!=b->clip || a->res!=b->res || a->cap!=b->cap ||
+           a->gr!=b->gr || a->grr!=b->grr;
+}
+/* Whether `now_state` is worth a datagram after `sent` (state_lock held). Health regenerates a
+ * little every frame: steps under GS_HP_STEP wait GS_SLOW_US, reaching 0 or full never waits. */
+static int state_due(const GameState *now_state, uint64_t now) {
+    if (!gs_valid || state_differs(now_state,&gs_sent)) return 1;
+    if (now_state->hp==gs_sent.hp) return 0;
+    const int32_t d=now_state->hp>gs_sent.hp ? now_state->hp-gs_sent.hp : gs_sent.hp-now_state->hp;
+    if (d>=GS_HP_STEP || now_state->hp<=0 || now_state->hp==1000) return 1;
+    return now-gs_sent_us>=GS_SLOW_US;
+}
+static void send_state(const GameState *s, int refresh, uint64_t ups, uint64_t wps) {
+    char extra[64]="";
+    if (refresh) snprintf(extra,sizeof(extra),",\"re\":1,\"ups\":%" PRIu64 ",\"wps\":%" PRIu64,ups,wps);
+    emit("gs",",\"hp\":%" PRId32 ",\"inj\":%" PRId32 ",\"ws\":%" PRId32 ",\"w\":\"0x%" PRIx32 "\",\"clip\":%" PRId32
+         ",\"res\":%" PRId32 ",\"cap\":%" PRId32 ",\"gr\":%" PRId32 ",\"grr\":%" PRId32 "%s",
+         s->hp,s->inj,s->ws,s->w,s->clip,s->res,s->cap,s->gr,s->grr,extra);
+}
+static void publish_state(uint64_t now) {
+    GameState s; int send;
+    pthread_mutex_lock(&state_lock);
+    compose(&s,now);
+    send=gs_have_player && state_due(&s,now);
+    if (send) { gs_sent=s; gs_valid=1; gs_sent_us=now; }
+    pthread_mutex_unlock(&state_lock);
+    if (send) send_state(&s,0,0,0);
+}
+static void game_state_refresh(uint64_t now) {
+    if (!atomic_load_explicit(&state_enabled,memory_order_relaxed)) return;
+    const uint64_t players=atomic_load_explicit(&gs_player_calls,memory_order_relaxed);
+    const uint64_t controllers=atomic_load_explicit(&gs_controller_calls,memory_order_relaxed);
+    const uint64_t ups=players-gs_player_refresh, wps=controllers-gs_controller_refresh;
+    gs_player_refresh=players; gs_controller_refresh=controllers;
+    if (!players && !controllers) return; /* nothing seen yet (menus, or another version) */
+    GameState s;
+    pthread_mutex_lock(&state_lock);
+    compose(&s,now);
+    gs_sent=s; gs_valid=1; gs_sent_us=now;
+    pthread_mutex_unlock(&state_lock);
+    send_state(&s,1,ups,wps);
+}
+static void game_state_counters(char *out, size_t size) {
+    out[0]=0;
+    if (!atomic_load_explicit(&state_enabled,memory_order_relaxed)) return;
+    snprintf(out,size,",\"gsp\":%" PRIu64 ",\"gsw\":%" PRIu64 ",\"gss\":%" PRIu64 ",\"gsd\":%" PRIu64 ",\"gsf\":%" PRIu64,
+             atomic_load_explicit(&gs_player_calls,memory_order_relaxed),
+             atomic_load_explicit(&gs_controller_calls,memory_order_relaxed),
+             atomic_load_explicit(&gs_shots,memory_order_relaxed),
+             atomic_load_explicit(&gs_damages,memory_order_relaxed),
+             atomic_load_explicit(&gs_peek_failures,memory_order_relaxed));
+}
+
+/* rdi = the player (oldplayer.cpp update). */
+static void __attribute__((ms_abi)) state_player(uint64_t player, uint64_t rsi, uint64_t image, uint64_t r14,
+                                                  const RuntimeGuestRegs *regs) {
+    (void)rsi; (void)r14; (void)regs;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !player) return;
+    atomic_fetch_add_explicit(&gs_player_calls,1,memory_order_relaxed);
+    const GameOffsets *o=offsets;
+    if (atomic_exchange_explicit(&gs_player,(uintptr_t)player,memory_order_relaxed)!=(uintptr_t)player) {
+        state_log("player object %#" PRIx64 " (image %#" PRIx64 "), health %.3f\n",player,image,
+                  (double)load_float((uintptr_t)player+o->health));
+        pthread_mutex_lock(&state_lock);
+        gs_valid=0; /* a new player (level load): the next state goes out at once */
+        pthread_mutex_unlock(&state_lock);
+    }
+    const int32_t hp=health_milli(load_float((uintptr_t)player+o->health));
+    const int32_t inj=*(const volatile uint8_t *)(uintptr_t)(player+o->injured) ? 1 : 0;
+    const uint64_t now=now_us();
+    pthread_mutex_lock(&state_lock);
+    gs_hp=hp; gs_inj=inj; gs_have_player=1;
+    pthread_mutex_unlock(&state_lock);
+    publish_state(now);
+}
+/* rdi = a WeaponController (PostJointUpdate). Once one controller's m_pGameObject has been the
+ * player, controllers of other objects are ignored. */
+static void __attribute__((ms_abi)) state_controller(uint64_t controller, uint64_t rsi, uint64_t image, uint64_t r14,
+                                                      const RuntimeGuestRegs *regs) {
+    (void)rsi; (void)image; (void)r14; (void)regs;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !controller) return;
+    const GameOffsets *o=offsets;
+    const uintptr_t owner=(uintptr_t)load_u64((uintptr_t)controller+o->controller_owner);
+    const uintptr_t player=atomic_load_explicit(&gs_player,memory_order_relaxed);
+    if (player && owner==player) {
+        if (!atomic_exchange_explicit(&owner_confirmed,1,memory_order_relaxed))
+            state_log("weapon controller %#" PRIx64 " belongs to the player\n",controller);
+    } else if (atomic_load_explicit(&owner_confirmed,memory_order_relaxed)) {
+        atomic_fetch_add_explicit(&gs_controller_foreign,1,memory_order_relaxed);
+        return;
+    }
+    atomic_fetch_add_explicit(&gs_controller_calls,1,memory_order_relaxed);
+    if (atomic_exchange_explicit(&gs_controller,(uintptr_t)controller,memory_order_relaxed)!=(uintptr_t)controller)
+        state_log("weapon controller %#" PRIx64 " (owner %#" PRIxPTR ", player %#" PRIxPTR ")\n",controller,owner,player);
+    WeaponState w;
+    read_weapon((uintptr_t)controller,&w);
+    w.us=now_us();
+    pthread_mutex_lock(&state_lock);
+    gs_weapon=w;
+    pthread_mutex_unlock(&state_lock);
+    publish_state(w.us);
+}
+/* r14 = the weapon WeaponController::Fire is about to take a round from. */
+static void __attribute__((ms_abi)) state_shot(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t weapon,
+                                                const RuntimeGuestRegs *regs) {
+    (void)rdi; (void)rsi; (void)image; (void)regs;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !weapon) return;
+    atomic_fetch_add_explicit(&gs_shots,1,memory_order_relaxed);
+    const GameOffsets *o=offsets;
+    const uint32_t type=load_u32((uintptr_t)weapon+o->weapon_type);
+    int32_t ammo[3];
+    memcpy(ammo,(const void *)(uintptr_t)(weapon+o->weapon_ammo),sizeof(ammo));
+    emit("shot",",\"w\":\"0x%" PRIx32 "\",\"clip\":%" PRId32 ",\"res\":%" PRId32 ",\"cap\":%" PRId32,type,ammo[0],ammo[1],ammo[2]);
+}
+/* The damage branch: player = r14, damage = r15 (saved by the loader's thunk in regs). */
+static void __attribute__((ms_abi)) state_damage(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t player,
+                                                 const RuntimeGuestRegs *regs) {
+    (void)rdi; (void)rsi; (void)image;
+    const uint64_t damage=regs ? regs->r15 : 0;
+    if (!atomic_load_explicit(&active,memory_order_relaxed) || !player || !damage) return;
+    atomic_fetch_add_explicit(&gs_damages,1,memory_order_relaxed);
+    const GameOffsets *o=offsets;
+    const uint32_t type=load_u32((uintptr_t)damage+o->damage_type);
+    const uint64_t source=load_u64((uintptr_t)damage+o->damage_source);
+    const float amount=load_float((uintptr_t)damage+o->damage_amount);
+    const float health=load_float((uintptr_t)player+o->health);
+    float loc[8]={0,0,0,0,0,0,0,1}, src[4]={0,0,0,0};
+    const uint64_t locator=load_u64((uintptr_t)player+o->locator);
+    const int have_loc=locator && peek((uintptr_t)locator+0x10,loc,sizeof(loc));
+    const int have_src=source && peek((uintptr_t)source+o->source_position,src,sizeof(src));
+    emit("dmg",",\"ty\":%" PRIu32 ",\"amt\":%ld,\"hp\":%" PRId32 ",\"src\":%d,\"sx\":%ld,\"sy\":%ld,\"sz\":%ld,"
+         "\"loc\":%d,\"px\":%ld,\"py\":%ld,\"pz\":%ld,\"qx\":%ld,\"qy\":%ld,\"qz\":%ld,\"qw\":%ld",
+         type,scaled(amount,1000.0f),health_milli(health),have_src,scaled(src[0],1000.0f),scaled(src[1],1000.0f),
+         scaled(src[2],1000.0f),have_loc,scaled(loc[0],1000.0f),scaled(loc[1],1000.0f),scaled(loc[2],1000.0f),
+         scaled(loc[4],10000.0f),scaled(loc[5],10000.0f),scaled(loc[6],10000.0f),scaled(loc[7],10000.0f));
+}
+/* U1 code at the hooks: pattern, then the hook's distance into it and the bytes moved to the thunk
+ * (whole position-independent instructions). Wildcards: RIP-relative displacements, call targets,
+ * and the two instructions GoldHEN-style cheats rewrite (the damage branch's jne, the
+ * ConsumeRound call), so the hooks still attach with the port's Infinite Health / Ammo cheats on.
+ * With Infinite Health the game skips the damage branch: no dmg events then. */
+static const RuntimeGuestCallback u1_state_callbacks[]={
+    /* 0x2645f0: push rbp; mov rbp, rsp; push r15 r14 r13 r12 rbx; sub rsp, 0x1d8; mov r12, rdi; ... */
+    {"UNDS U1 player update (state)",
+      "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec d8 01 00 00 49 89 fc 48 8b 05 ?? ?? ?? ?? "
+      "48 8b 00 48 89 45 d0 e8 ?? ?? ?? ?? c7 45 b8 08 00 00 00 48 8d 0d ?? ?? ?? ?? 48 89 4d b0 "
+      "c7 45 a8 00 00 00 00 48 c7 45 a0 00 00 00 00",
+      0, 6, state_player, NULL},
+    /* 0x71e920: WeaponController::PostJointUpdate prologue; mov r14, rdi; ... cmp [kGrenade], 4;
+     * [r14+0x190], [r14+0x128]->+0xa8, mov esi, 0xcd670e33 */
+    {"UNDS U1 weapon controller (state)",
+      "55 48 89 e5 41 57 41 56 41 54 53 48 81 ec 80 00 00 00 49 89 fe 4c 8b 3d ?? ?? ?? ?? "
+      "49 8b 07 48 89 45 d8 48 8d 05 ?? ?? ?? ?? 83 38 04 74 0d 49 8b be 90 01 00 00 48 8b 07 ff 50 70 "
+      "49 8b 86 28 01 00 00 48 8b b8 a8 00 00 00 be 33 0e 67 cd",
+      0, 6, state_controller, NULL},
+    /* 0x71affe (pattern at 0x71afe9): WeaponController::Fire, xor esi, esi; mov rdi, r14; call ConsumeRound */
+    {"UNDS U1 player shot (state)",
+      "4c 8d 45 88 4c 8d 8d 78 ff ff ff bf 64 8f f1 b0 e8 ?? ?? ?? ?? 31 f6 4c 89 f7 ?? ?? ?? ?? ?? "
+      "49 8b 04 24 48 3b 45 d8 75 0d 48 83 c4 70 5b 41 5c 41 5e 41 5f 5d c3",
+      21, 5, state_shot, NULL},
+    /* 0x261eea (pattern at 0x261ed0): Player::EventHandler damage branch,
+     * vsubss xmm0, xmm0, [r15+0x14]; vmovss [r14+0x1428], xmm0 */
+    {"UNDS U1 player damage (state)",
+      "48 8d 15 ?? ?? ?? ?? 8a 12 0a 11 ?? 35 85 c0 75 31 c4 c1 7a 10 86 28 14 00 00 "
+      "c4 c1 7a 5c 47 14 c4 c1 7a 11 86 28 14 00 00 49 8b be 48 02 00 00 48 8b 07 ff 50 28 "
+      "48 8d 3d ?? ?? ?? ?? e8 ?? ?? ?? ??",
+      26, 6, state_damage, NULL},
+};
+
+const RuntimeGuestCallback *runtime_unds_guest_callbacks(size_t *count) {
+    *count=0;
+    const char *events=getenv("UNDS_EVENTS"), *state=getenv("UNDS_STATE"), *debug=getenv("UNDS_STATE_DEBUG");
+    if (!events || !*events || (state && !strcmp(state,"0"))) return u1_state_callbacks;
+    exe_names();
+    if (strcmp(exe_id,"u1")) return u1_state_callbacks; /* U2 and U3: not mapped yet */
+    offsets=&u1_100;
+    *count=sizeof(u1_state_callbacks)/sizeof(*u1_state_callbacks);
+    atomic_store(&state_enabled,1);
+    atomic_store(&state_debug,debug && !strcmp(debug,"1"));
+    return u1_state_callbacks;
+}
+
 void runtime_unds_report(void) {
     if (!atomic_load(&configured)) return;
+    if (atomic_load(&state_enabled))
+        printf("Runtime: UNDS state: player updates=%" PRIu64 ", weapon controller updates=%" PRIu64 " (other objects %" PRIu64
+               "), shots=%" PRIu64 ", damage=%" PRIu64 ", failed reads=%" PRIu64 "\n",
+               atomic_load(&gs_player_calls),atomic_load(&gs_controller_calls),atomic_load(&gs_controller_foreign),
+               atomic_load(&gs_shots),atomic_load(&gs_damages),atomic_load(&gs_peek_failures));
     printf("Runtime: UNDS events sent=%" PRIu64 ", dropped=%" PRIu64 ", errors=%" PRIu64 " (last %d), "
            "longest sendto %" PRIu64 " us, sends over 1 ms=%" PRIu64 ", scePadSetVibration calls=%" PRIu64 "\n",
            atomic_load(&sent),atomic_load(&dropped),atomic_load(&errors),atomic_load(&last_error),

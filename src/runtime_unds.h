@@ -9,6 +9,9 @@
  *                                 companion (DSX, later SDL in-process) owns the LED
  *   UNDS_TRIGGER=<l2>,<r2>        trigger travel (1-254 of 255) above which L2 / R2 count as
  *                                 pressed; default 30,30 (the port's built-in threshold)
+ *   UNDS_STATE=0                  no game-state callbacks (health, weapon, ammunition, damage;
+ *                                 on by default with UNDS_EVENTS, U1 1.00 only so far)
+ *   UNDS_STATE_DEBUG=1            the objects the game-state callbacks find, in the log
  * UNDS_RUMBLE, UNDS_LED and UNDS_TRIGGER work with or without UNDS_EVENTS.
  *
  * Protocol v1: every datagram is one JSON object with
@@ -19,7 +22,7 @@
 #include <stdint.h>
 
 #define UNDS_PROTOCOL 1
-#define UNDS_VERSION "0.3.0"
+#define UNDS_VERSION "0.4.1"
 
 /* Reads UNDS_EVENTS / UNDS_RUMBLE / UNDS_LED / UNDS_TRIGGER; with UNDS_EVENTS, opens the socket, sends "hello" and starts
  * the 1 s heartbeat. `image` is the guest image base. Silent when neither variable is set. */

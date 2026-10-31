@@ -5,6 +5,7 @@
 #include "../src/runtime_unds.c"
 #undef NDEBUG /* the checks below have side effects */
 #include <assert.h>
+#include <ctype.h>
 
 static unds_socket_t rx=UNDS_INVALID_SOCKET;
 static uint32_t expect_seq;
@@ -118,11 +119,124 @@ static void test_audio(void) {
     assert(next_event(e,sizeof(e),500) && field(e,"p")==17 && field(e,"ty")==4 && field(e,"rms")==5000 && field(e,"pk")==5000);
 }
 
+/* Game state: the callbacks on objects laid out like U1 1.00's (player, weapon controller,
+ * weapons, handle slots, a damage record). */
+static void test_state(void) {
+    char e[512];
+    size_t count=0;
+    const RuntimeGuestCallback *c=runtime_unds_guest_callbacks(&count);
+    assert(count==4 && atomic_load(&state_enabled));
+    assert(c[0].callback==state_player && c[1].callback==state_controller && c[2].callback==state_shot && c[3].callback==state_damage);
+    assert(c[0].skip==0 && c[0].moved==6 && c[1].skip==0 && c[1].moved==6 && c[2].skip==21 && c[2].moved==5 &&
+           c[3].skip==26 && c[3].moved==6);
+    for (size_t i=0;i<count;++i) {
+        /* the loader's pattern syntax: "xx" or "??" separated by single spaces; the hook and the
+           moved bytes lie inside the pattern and are not wildcards (they are copied to the thunk) */
+        const char *t=c[i].pattern;
+        size_t n=0, len=strlen(t);
+        assert(len%3==2 && !strncmp(c[i].name,"UNDS U1 ",8) && !c[i].patch);
+        for (size_t k=0;k<len;k+=3,++n) {
+            assert((isxdigit((unsigned char)t[k]) && isxdigit((unsigned char)t[k+1])) || (t[k]=='?' && t[k+1]=='?'));
+            assert(k+2==len || t[k+2]==' ');
+            if (n>=c[i].skip && n<c[i].skip+c[i].moved) assert(t[k]!='?');
+        }
+        assert(c[i].skip+c[i].moved<=n);
+    }
+    static _Alignas(16) unsigned char player[0x1500], controller[0x200], rifle[0x500], grenade[0x500], damage[0x40], source[0x40];
+    static _Alignas(16) float locator[12];
+    static uint64_t rifle_slot, grenade_slot;
+    float f; uint32_t u; int32_t ammo[3]; uint64_t p;
+    RuntimeGuestRegs damage_regs={0};
+    damage_regs.r15=(uint64_t)(uintptr_t)damage;
+    /* player: full health, locator at (1, 2, 3) with the identity rotation */
+    f=1.0f; memcpy(player+0x1428,&f,4); player[0x1430]=0;
+    p=(uint64_t)(uintptr_t)locator; memcpy(player+0xf0,&p,8);
+    locator[4]=1.0f; locator[5]=2.0f; locator[6]=3.0f; locator[11]=1.0f;
+    /* before any player: the controller alone publishes nothing */
+    p=(uint64_t)(uintptr_t)player; memcpy(controller+0x128,&p,8);
+    state_controller((uint64_t)(uintptr_t)controller,0,0,0,NULL);
+    no_event(30);
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"gs\"") && field(e,"hp")==1000 && field(e,"inj")==0);
+    assert(field(e,"ws")==-1 && has(e,"\"w\":\"0x0\"") && field(e,"clip")==-1 && field(e,"gr")==-1);
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    no_event(30);
+    /* a rifle in slot 2 (handle: slot pointer, id 77 = the process's +0x64), grenades in slot 4 */
+    u=0xa1b2c3d4u; memcpy(rifle+0x2e4,&u,4); u=77; memcpy(rifle+0x64,&u,4);
+    ammo[0]=30; ammo[1]=90; ammo[2]=30; memcpy(rifle+0x440,ammo,12);
+    rifle_slot=(uint64_t)(uintptr_t)rifle; p=(uint64_t)(uintptr_t)&rifle_slot;
+    memcpy(controller+0x130+16*2,&p,8); memcpy(controller+0x130+16*2+8,&u,4);
+    u=5; memcpy(grenade+0x64,&u,4); ammo[0]=2; ammo[1]=1; memcpy(grenade+0x440,ammo,12);
+    grenade_slot=(uint64_t)(uintptr_t)grenade; p=(uint64_t)(uintptr_t)&grenade_slot;
+    memcpy(controller+0x130+16*4,&p,8); memcpy(controller+0x130+16*4+8,&u,4);
+    u=2; memcpy(controller+0x198,&u,4);
+    state_controller((uint64_t)(uintptr_t)controller,0,0,0,NULL);
+    assert(atomic_load(&owner_confirmed));
+    assert(next_event(e,sizeof(e),500) && field(e,"ws")==2 && has(e,"\"w\":\"0xa1b2c3d4\"") && field(e,"clip")==30 &&
+           field(e,"res")==90 && field(e,"cap")==30 && field(e,"gr")==2 && field(e,"grr")==1);
+    /* a shot: the round before ConsumeRound takes it, then the new clip */
+    state_shot(0,0,0,(uint64_t)(uintptr_t)rifle,NULL);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"shot\"") && has(e,"\"w\":\"0xa1b2c3d4\"") && field(e,"clip")==30);
+    ammo[0]=29; ammo[1]=90; ammo[2]=30; memcpy(rifle+0x440,ammo,12);
+    state_controller((uint64_t)(uintptr_t)controller,0,0,0,NULL);
+    assert(next_event(e,sizeof(e),500) && field(e,"clip")==29);
+    /* stale handle (id changed: the weapon was dropped): no weapon */
+    u=78; memcpy(rifle+0x64,&u,4);
+    state_controller((uint64_t)(uintptr_t)controller,0,0,0,NULL);
+    assert(next_event(e,sizeof(e),500) && field(e,"ws")==-1 && field(e,"clip")==-1 && field(e,"gr")==2);
+    u=77; memcpy(rifle+0x64,&u,4);
+    state_controller((uint64_t)(uintptr_t)controller,0,0,0,NULL);
+    assert(next_event(e,sizeof(e),500) && field(e,"ws")==2);
+    /* a controller of another object is ignored once the player's has been seen */
+    static unsigned char other[0x200];
+    memcpy(other,controller,sizeof(other)); p=1234; memcpy(other+0x128,&p,8); u=0; memcpy(other+0x198,&u,4);
+    state_controller((uint64_t)(uintptr_t)other,0,0,0,NULL);
+    no_event(30);
+    assert(atomic_load(&gs_controller_foreign)==1);
+    /* damage: 0.25 from a source at (4, 2, 3), health 1.0 before; then the new health */
+    u=3; memcpy(damage,&u,4); p=(uint64_t)(uintptr_t)source; memcpy(damage+8,&p,8);
+    f=0.25f; memcpy(damage+0x14,&f,4);
+    f=4.0f; memcpy(source+0x10,&f,4); f=2.0f; memcpy(source+0x14,&f,4); f=3.0f; memcpy(source+0x18,&f,4);
+    state_damage(0,0,0,(uint64_t)(uintptr_t)player,&damage_regs);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"dmg\"") && field(e,"ty")==3 && field(e,"amt")==250 && field(e,"hp")==1000);
+    assert(field(e,"src")==1 && field(e,"sx")==4000 && field(e,"sz")==3000 && field(e,"loc")==1 && field(e,"px")==1000 &&
+           field(e,"py")==2000 && field(e,"qw")==10000 && field(e,"qx")==0);
+    f=0.75f; memcpy(player+0x1428,&f,4); player[0x1430]=1;
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"gs\"") && field(e,"hp")==750 && field(e,"inj")==1);
+    /* regeneration: +0.002 steps wait 100 ms, +0.005 goes at once, full health at once */
+    f=0.752f; memcpy(player+0x1428,&f,4);
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    no_event(30);
+    f=0.757f; memcpy(player+0x1428,&f,4);
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    assert(next_event(e,sizeof(e),500) && field(e,"hp")==757);
+    f=1.0f; memcpy(player+0x1428,&f,4); player[0x1430]=0;
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    assert(next_event(e,sizeof(e),500) && field(e,"hp")==1000);
+    /* no source (a fall): src 0; a value that cannot be health: -1 */
+    memset(damage+8,0,8);
+    state_damage(0,0,0,(uint64_t)(uintptr_t)player,&damage_regs);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"dmg\"") && field(e,"src")==0 && field(e,"sx")==0);
+    f=37.0f; memcpy(player+0x1428,&f,4);
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    assert(next_event(e,sizeof(e),500) && field(e,"hp")==-1);
+    f=0.0f; memcpy(player+0x1428,&f,4);
+    state_player((uint64_t)(uintptr_t)player,0,0x400000,0,NULL);
+    assert(next_event(e,sizeof(e),500) && field(e,"hp")==0);
+    /* unmapped memory: a read fails instead of faulting */
+    char byte;
+    assert(!peek(0x10,&byte,1) && !peek(UINTPTR_MAX-2,&byte,8));
+}
+
 int main(void) {
     test_parse();
     test_thresholds();
     set_env("BB_EXE","big2-ps4_Shipping.elf");
     /* No UNDS_* variables: defaults, nothing is active, every call returns at once. */
+    size_t callbacks=1;
+    runtime_unds_guest_callbacks(&callbacks);
+    assert(!callbacks && !atomic_load(&state_enabled)); /* no game-state hooks without UNDS_EVENTS */
     runtime_unds_start(0x1234);
     assert(!atomic_load(&active) && !atomic_load(&configured) && runtime_unds_rumble_enabled() && runtime_unds_led_enabled());
     assert(runtime_unds_trigger_threshold(0)==30 && runtime_unds_trigger_threshold(1)==30);
@@ -141,6 +255,10 @@ int main(void) {
     char endpoint[64], e[512];
     open_receiver(endpoint,sizeof(endpoint));
     set_env("UNDS_EVENTS",endpoint);
+    set_env("UNDS_STATE","0");
+    runtime_unds_guest_callbacks(&callbacks);
+    assert(!callbacks); /* UNDS_STATE=0: events without game-state hooks */
+    set_env("UNDS_STATE","");
     set_env("UNDS_RUMBLE","0");
     runtime_unds_start(0xb400000);
     assert(atomic_load(&active) && !runtime_unds_rumble_enabled());
@@ -176,16 +294,25 @@ int main(void) {
     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0);
 
     test_audio();
+    runtime_unds_guest_callbacks(&callbacks);
+    assert(!callbacks && !atomic_load(&state_enabled)); /* U2: the U1 game-state hooks are not handed out */
+    set_env("BB_EXE","eboot.bin");
+    test_state();
 
-    /* heartbeat: hello every second with counters, refreshes carry re:1 */
-    int hello=0, refresh=0;
-    for (int i=0;i<40 && (!hello || !refresh);++i) {
+    /* heartbeat: hello every second with counters, refreshes carry re:1 (game state: ups/wps) */
+    int hello=0, refresh=0, state_refresh=0;
+    for (int i=0;i<40 && (!hello || !refresh || !state_refresh);++i) {
         if (!receive(e,sizeof(e),100)) continue;
         assert((uint32_t)field(e,"seq")==expect_seq); ++expect_seq;
-        if (has(e,"\"e\":\"hello\"")) { hello=1; assert(field(e,"boot")==0 && field(e,"sent")>0 && has(e,"\"ports\":\"0:0:8:1024,17:4:1:256\"")); }
+        if (has(e,"\"e\":\"hello\"")) {
+            hello=1;
+            assert(field(e,"boot")==0 && field(e,"sent")>0 && has(e,"\"ports\":\"0:0:8:1024,17:4:1:256\""));
+            assert(field(e,"gsp")>=8 && field(e,"gss")==1 && field(e,"gsd")==2);
+        }
         if (has(e,"\"re\":1")) refresh=1;
+        if (has(e,"\"e\":\"gs\"") && has(e,"\"re\":1")) { state_refresh=1; assert(field(e,"hp")==0 && field(e,"ups")>=0); }
     }
-    assert(hello && refresh);
+    assert(hello && refresh && state_refresh);
 
     runtime_unds_bye("loadexec");
     assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"bye\"") && has(e,"\"reason\":\"loadexec\""));
