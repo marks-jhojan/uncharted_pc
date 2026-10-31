@@ -44,6 +44,54 @@ def no_console():
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
+def start_companion(env, user_dir):
+    """A DualSense companion (UNDS: adaptive triggers, light bar and haptics) shipped in UNDS/ beside
+    the port starts with the game, whichever way the game is started (launcher, --play shortcuts).
+
+    `UNDS.exe --env` prints the variables it wants (NAME=value lines; exit code 1 = turned off in its
+    unds_launcher.ini); they do not override what the player set. UNDS_WINDOW (not passed on) says how
+    the companion runs: console (default: its own minimized console) or hidden (no window at all, it
+    writes its own log). It ends by itself when this process does. Nothing happens without UNDS/UNDS.exe,
+    with UNDS_AUTO=0, or when UNDS_EVENTS is already set by someone else who runs a companion (not by an
+    earlier run of this script: "Apply and restart" starts a new one for the new process)."""
+    companion = PORT / 'UNDS' / 'UNDS.exe'
+    external = env.get('UNDS_EVENTS') and env.get('UNDS_AUTO_STARTED') != '1'
+    if os.name != 'nt' or not companion.is_file() or external or env.get('UNDS_AUTO') == '0':
+        return
+    try:
+        query = subprocess.run([str(companion), '--env'], capture_output=True, text=True, timeout=30,
+                               stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f'UNDS: {companion} did not answer ({error}); playing without it')
+        return
+    if query.returncode:
+        return
+    wanted = dict(line.split('=', 1) for line in query.stdout.splitlines() if line.startswith('UNDS_') and '=' in line)
+    if not wanted.get('UNDS_EVENTS'):
+        return
+    window = wanted.pop('UNDS_WINDOW', 'console').strip().lower()
+    for key, value in wanted.items():
+        env.setdefault(key.strip(), value.strip())
+    env['UNDS_AUTO_STARTED'] = '1'
+    # Never this script's own output handles: the launcher reads them into last_run.log (and would wait
+    # for the companion to close them).
+    if window != 'hidden':
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 7  # SW_SHOWMINNOACTIVE: a console in the taskbar, the game keeps the focus
+        # No std handles given: the companion uses those of its new console.
+        options = {'startupinfo': startup, 'creationflags': subprocess.CREATE_NEW_CONSOLE}
+    else:
+        options = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
+                   'creationflags': subprocess.CREATE_NO_WINDOW}
+    try:
+        subprocess.Popen([str(companion), '--attach', str(os.getpid()), '--game', str(PORT),
+                          '--log', str(user_dir / 'last_run.log')], cwd=companion.parent, env=env, **options)
+        print(f'UNDS: companion started ({env["UNDS_EVENTS"]})')
+    except OSError as error:
+        print(f'UNDS: could not start {companion}: {error}')
+
+
 def run_script(name, *args):
     # Inside the packaged executable (PyInstaller) the executable runs scripts itself.
     script = ['--script'] if getattr(sys, 'frozen', False) else []
@@ -211,6 +259,7 @@ def main():
     player_small = env.get('BB_READBACK_SMALL_BUFFERS')
     player_copy = env.get('BB_SCALAR_COPY64_SYNC')
     all_cheats = env.setdefault('BB_CHEATS_ALL', env.get('BB_CHEATS', ''))
+    start_companion(env, user_dir)
     while True:
         if player_merge is None:
             if exe == EXECUTABLES['u2']:
