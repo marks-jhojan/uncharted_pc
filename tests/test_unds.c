@@ -1,14 +1,51 @@
 /* UNDS event bus: endpoint parsing, change detection, pad rate limit, audio levels, protocol
- * fields, seq continuity, "bye", UNDS_LED and UNDS_TRIGGER. Sends to a UDP socket of its own on 127.0.0.1.
+ * fields, seq continuity, "bye", UNDS_LED and UNDS_TRIGGER, and the fx control channel (reports
+ * handed to a stand-in of runtime_pad.c). Sends to a UDP socket of its own on 127.0.0.1.
  * Linux:            cc -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c -lm -o out/unds-test
  * MSYS2 CLANG64:    clang -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c src/compat_win.c -lws2_32 -lbcrypt -o out/unds-test.exe */
 #include "../src/runtime_unds.c"
 #undef NDEBUG /* the checks below have side effects */
 #include <assert.h>
 #include <ctype.h>
+#include <signal.h>
 
 static unds_socket_t rx=UNDS_INVALID_SOCKET;
-static uint32_t expect_seq;
+/* seq: every datagram exactly once. Three threads send (the caller, the heartbeat, the fx
+ * receiver) and each takes its seq before its sendto, so two sends at the same moment can arrive
+ * swapped: the order is not checked, losses and repeats are (check_no_gaps at the end). */
+static uint8_t seen_seq[8192];
+static uint32_t max_seq, reordered;
+static size_t longest_datagram;
+static void note_seq(const char *json);
+
+/* runtime_pad.c stand-ins: the DS5EffectsState_t reports the control channel hands to SDL. */
+static pthread_mutex_t pad_stub=PTHREAD_MUTEX_INITIALIZER;
+static uint8_t pad_report[UNDS_DS5_EFFECTS_SIZE], game_led_rgb[3];
+static int pad_reports, pad_result=1, game_led_calls;
+static unsigned pad_generation;
+int runtime_pad_unds_effect(const uint8_t *effects, int size) {
+    assert(size==UNDS_DS5_EFFECTS_SIZE);
+    pthread_mutex_lock(&pad_stub);
+    memcpy(pad_report,effects,sizeof(pad_report)); ++pad_reports;
+    const int result=pad_result;
+    pthread_mutex_unlock(&pad_stub);
+    return result;
+}
+unsigned runtime_pad_unds_generation(void) {
+    pthread_mutex_lock(&pad_stub);
+    const unsigned generation=pad_generation;
+    pthread_mutex_unlock(&pad_stub);
+    return generation;
+}
+void runtime_pad_unds_game_led(uint8_t r, uint8_t g, uint8_t b) {
+    pthread_mutex_lock(&pad_stub);
+    game_led_rgb[0]=r; game_led_rgb[1]=g; game_led_rgb[2]=b; ++game_led_calls;
+    pthread_mutex_unlock(&pad_stub);
+}
+static int reports(void) { pthread_mutex_lock(&pad_stub); const int n=pad_reports; pthread_mutex_unlock(&pad_stub); return n; }
+static void last_report(uint8_t out[UNDS_DS5_EFFECTS_SIZE]) {
+    pthread_mutex_lock(&pad_stub); memcpy(out,pad_report,UNDS_DS5_EFFECTS_SIZE); pthread_mutex_unlock(&pad_stub);
+}
 
 static void open_receiver(char *endpoint, size_t size) {
 #ifdef _WIN32
@@ -28,8 +65,12 @@ static int receive(char *out, size_t size, int ms) {
     fd_set set; FD_ZERO(&set); FD_SET(rx,&set);
     struct timeval timeout={ms/1000,(ms%1000)*1000};
     if (select((int)rx+1,&set,NULL,NULL,&timeout)<=0) return 0;
-    int n=(int)recv(rx,out,(int)size-1,0);
+    static char buffer[4096]; /* Windows refuses a datagram longer than the buffer (WSAEMSGSIZE) */
+    int n=(int)recv(rx,buffer,(int)sizeof(buffer),0);
     assert(n>0);
+    if ((size_t)n>longest_datagram) longest_datagram=(size_t)n;
+    assert((size_t)n<size && "datagram longer than the test's buffer");
+    memcpy(out,buffer,(size_t)n);
     out[n]=0;
     return 1;
 }
@@ -40,20 +81,39 @@ static long long field(const char *json, const char *key) {
     return strtoll(at+strlen(pattern),NULL,10);
 }
 static int has(const char *json, const char *text) { return strstr(json,text)!=NULL; }
+static void note_seq(const char *json) {
+    const long long seq=field(json,"seq");
+    assert(seq>=0 && seq<(long long)sizeof(seen_seq));
+    if (seen_seq[seq]) { printf("unds-test: seq %lld twice\n",seq); assert(0 && "repeated seq"); }
+    seen_seq[seq]=1;
+    if ((uint32_t)seq<max_seq) ++reordered;
+    else max_seq=(uint32_t)seq;
+}
+static void check_no_gaps(void) {
+    for (uint32_t s=0;s<=max_seq;++s)
+        if (!seen_seq[s]) { printf("unds-test: datagram seq %u never arrived (last seq %u)\n",s,max_seq); assert(0 && "lost datagram"); }
+}
 /* Next datagram that is not a heartbeat (hello, refreshes); checks v and seq continuity. */
+/* The last datagram next_event saw: printed when an assertion fails (SIGABRT). */
+static char last_event[1024]="(none)";
+static void print_last_event(int signal_number) {
+    (void)signal_number;
+    fprintf(stderr,"unds-test: last datagram seen: %s\n",last_event);
+    fflush(stderr);
+}
 static int next_event(char *out, size_t size, int ms) {
     for (;;) {
-        if (!receive(out,size,ms)) return 0;
+        if (!receive(out,size,ms)) { snprintf(last_event,sizeof(last_event),"(none within %d ms)",ms); return 0; }
+        snprintf(last_event,sizeof(last_event),"%s",out);
         assert(field(out,"v")==1);
-        assert((uint32_t)field(out,"seq")==expect_seq);
-        ++expect_seq;
+        note_seq(out);
         if (has(out,"\"e\":\"hello\"") || has(out,"\"re\":1")) continue;
         return 1;
     }
 }
 static void no_event(int ms) {
     char text[512];
-    assert(!next_event(text,sizeof(text),ms));
+    if (next_event(text,sizeof(text),ms)) { printf("unds-test: unexpected datagram: %s\n",text); fflush(stdout); assert(0 && "no event expected"); }
 }
 static void set_env(const char *name, const char *value) {
 #ifdef _WIN32
@@ -229,7 +289,123 @@ static void test_state(void) {
     assert(!peek(0x10,&byte,1) && !peek(UINTPTR_MAX-2,&byte,8));
 }
 
+/* The control channel: datagrams from `from` to the port's fx socket. */
+static void fx_send(unds_socket_t from, int port, int flags, uint32_t command, const uint8_t *right, const uint8_t *left,
+                    const uint8_t *rgb, size_t size, uint8_t version) {
+    uint8_t d[64]; memset(d,0,sizeof(d));
+    memcpy(d,"UNDC",4); d[4]=version; d[5]=(uint8_t)flags;
+    d[8]=(uint8_t)command; d[9]=(uint8_t)(command>>8); d[10]=(uint8_t)(command>>16); d[11]=(uint8_t)(command>>24);
+    if (right) memcpy(d+12,right,11);
+    if (left) memcpy(d+23,left,11);
+    if (rgb) memcpy(d+34,rgb,3);
+    struct sockaddr_in to; memset(&to,0,sizeof(to));
+    to.sin_family=AF_INET; to.sin_addr.s_addr=htonl(0x7f000001u); to.sin_port=htons((uint16_t)port);
+    assert(sendto(from,(const char *)d,(int)size,0,(const struct sockaddr *)&to,(int)sizeof(to))==(int)size);
+}
+static void fx_cmd(int port, int flags, uint32_t command, const uint8_t *right, const uint8_t *left, const uint8_t *rgb) {
+    fx_send(rx,port,flags,command,right,left,rgb,UNDS_FX_SIZE,1);
+}
+/* The fx event answering command `command`. */
+static void fx_ack(char *e, size_t size, uint32_t command, int flags, int ok, const char *why) {
+    assert(next_event(e,size,500) && has(e,"\"e\":\"fx\""));
+    char text[32]; snprintf(text,sizeof(text),"\"why\":\"%s\"",why);
+    assert((uint32_t)field(e,"c")==command && field(e,"f")==flags && field(e,"ok")==ok && has(e,text));
+    assert(field(e,"q")>=0 && field(e,"q")<100000);
+}
+static void test_fx(int port) {
+    char e[512];
+    uint8_t r[UNDS_DS5_EFFECTS_SIZE];
+    /* WEAPON 3 4 8 and FEEDBACK 4 1 as unds_hid.py encodes them */
+    const uint8_t weapon[11]={0x25,0x18,0x00,0x07}, feedback[11]={0x21,0xf0,0x03}, rgb[3]={128,128,0};
+    assert(atomic_load(&fx_on) && port>0 && !runtime_unds_fx_led_owned());
+    /* R2 alone: enable bit 0x04 of the first byte, the effect at offset 10, nothing else */
+    fx_cmd(port,UNDS_FX_RIGHT,1,weapon,NULL,NULL);
+    fx_ack(e,sizeof(e),1,UNDS_FX_RIGHT,1,"cmd");
+    last_report(r);
+    assert(reports()==1 && r[0]==0x04 && r[1]==0 && !memcmp(r+10,weapon,11) && r[21]==0 && r[44]==0);
+    assert(atomic_load(&fx_held)==UNDS_FX_RIGHT);
+    /* L2 and the light bar in one report; the companion holds the light bar from now on */
+    fx_cmd(port,UNDS_FX_LEFT|UNDS_FX_LED,2,NULL,feedback,rgb);
+    fx_ack(e,sizeof(e),2,UNDS_FX_LEFT|UNDS_FX_LED,1,"cmd");
+    last_report(r);
+    assert(reports()==2 && r[0]==0x08 && r[1]==0x04 && !memcmp(r+21,feedback,11) && r[10]==0 && !memcmp(r+44,rgb,3));
+    assert(runtime_unds_fx_led_owned() && atomic_load(&fx_held)==(UNDS_FX_RIGHT|UNDS_FX_LEFT|UNDS_FX_LED));
+    /* never the rumble-emulation bits (they turn the audio haptics off) */
+    assert(!(r[0]&0x03));
+    /* the game's colour is still published (the companion builds its light bar from it) */
+    runtime_unds_led(64,0,0);
+    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"led\"") && field(e,"r")==64);
+    /* rejected: an unknown trigger mode, a short datagram, another version, another host */
+    const uint8_t bogus[11]={0x99};
+    fx_cmd(port,UNDS_FX_RIGHT,3,bogus,NULL,NULL);
+    fx_send(rx,port,UNDS_FX_RIGHT,4,weapon,NULL,NULL,UNDS_FX_SIZE-1,1);
+    fx_send(rx,port,UNDS_FX_RIGHT,5,weapon,NULL,NULL,UNDS_FX_SIZE,2);
+    unds_socket_t stranger=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+    struct sockaddr_in a; memset(&a,0,sizeof(a));
+    a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(0x7f000002u);
+    int strangers=0;
+    if (stranger!=UNDS_INVALID_SOCKET && !bind(stranger,(struct sockaddr *)&a,sizeof(a))) {
+        /* only where the source address survives (Wine reports 127.0.0.2 as 127.0.0.1) */
+        struct sockaddr_in me, from; socklen_t length=sizeof(me);
+        assert(!getsockname(rx,(struct sockaddr *)&me,&length));
+        assert(sendto(stranger,"probe",5,0,(const struct sockaddr *)&me,(int)sizeof(me))==5);
+        fd_set set; FD_ZERO(&set); FD_SET(rx,&set);
+        struct timeval timeout={0,500000};
+        assert(select((int)rx+1,&set,NULL,NULL,&timeout)==1);
+        char probe[16]; length=sizeof(from);
+        assert(recvfrom(rx,probe,(int)sizeof(probe),0,(struct sockaddr *)&from,&length)==5);
+        if (from.sin_addr.s_addr==a.sin_addr.s_addr) {
+            fx_send(stranger,port,UNDS_FX_RIGHT,6,weapon,NULL,NULL,UNDS_FX_SIZE,1);
+            strangers=1;
+        } else puts("unds-test: this system reports 127.0.0.2 as another address, the source check is not exercised");
+    } else puts("unds-test: no 127.0.0.2 here, the source check is not exercised");
+    no_event(150);
+    assert(reports()==2 && atomic_load(&fx_rejected)==(uint64_t)(3+strangers));
+    /* a keep-alive (no part): answered, nothing written */
+    fx_cmd(port,0,7,NULL,NULL,NULL);
+    fx_ack(e,sizeof(e),7,0,1,"cmd");
+    assert(reports()==2);
+    /* the controller reconnected: everything held, in one report */
+    pthread_mutex_lock(&pad_stub); ++pad_generation; pthread_mutex_unlock(&pad_stub);
+    fx_ack(e,sizeof(e),0,UNDS_FX_RIGHT|UNDS_FX_LEFT|UNDS_FX_LED,1,"reconnect");
+    last_report(r);
+    assert(reports()==3 && r[0]==0x0c && r[1]==0x04 && !memcmp(r+10,weapon,11) && !memcmp(r+21,feedback,11) && !memcmp(r+44,rgb,3));
+    /* not a DualSense: the result is answered and counted */
+    pthread_mutex_lock(&pad_stub); pad_result=-1; pthread_mutex_unlock(&pad_stub);
+    fx_cmd(port,UNDS_FX_RIGHT,8,weapon,NULL,NULL);
+    fx_ack(e,sizeof(e),8,UNDS_FX_RIGHT,-1,"cmd");
+    assert(atomic_load(&fx_failures)==1);
+    pthread_mutex_lock(&pad_stub); pad_result=1; pthread_mutex_unlock(&pad_stub);
+    /* release: both triggers off and the game's colour back (SDL may show it: UNDS_LED not 0) */
+    atomic_store(&led_on,1);
+    fx_cmd(port,UNDS_FX_RELEASE|UNDS_FX_RIGHT,9,weapon,NULL,NULL);   /* the other bits are ignored */
+    fx_ack(e,sizeof(e),9,UNDS_FX_RELEASE|UNDS_FX_RIGHT,1,"release");
+    last_report(r);
+    assert(r[0]==0x0c && r[10]==0x05 && r[21]==0x05 && r[1]==0x04 && r[44]==64 && r[45]==0 && r[46]==0);
+    assert(game_led_calls==1 && game_led_rgb[0]==64 && !runtime_unds_fx_led_owned() && !atomic_load(&fx_held));
+    /* watchdog: held state and no datagram for fx_timeout_us -> triggers off (the light bar was not held) */
+    fx_timeout_us=300000u;
+    fx_cmd(port,UNDS_FX_RIGHT,10,weapon,NULL,NULL);
+    fx_ack(e,sizeof(e),10,UNDS_FX_RIGHT,1,"cmd");
+    const int before=reports();
+    assert(next_event(e,sizeof(e),900) && has(e,"\"e\":\"fx\"") && has(e,"\"why\":\"timeout\"") && field(e,"f")==UNDS_FX_RELEASE);
+    last_report(r);
+    assert(reports()==before+1 && r[0]==0x0c && r[10]==0x05 && r[21]==0x05 && r[1]==0 && game_led_calls==1);
+    assert(atomic_load(&fx_timeouts)==1 && !atomic_load(&fx_held));
+    no_event(400); /* nothing held: the watchdog stays quiet */
+    fx_timeout_us=5000000u;
+    /* held again for the bye test in main() */
+    fx_cmd(port,UNDS_FX_RIGHT,11,weapon,NULL,NULL);
+    fx_ack(e,sizeof(e),11,UNDS_FX_RIGHT,1,"cmd");
+#ifdef _WIN32
+    if (stranger!=UNDS_INVALID_SOCKET) closesocket(stranger);
+#else
+    if (stranger!=UNDS_INVALID_SOCKET) close(stranger);
+#endif
+}
+
 int main(void) {
+    signal(SIGABRT,print_last_event);
     test_parse();
     test_thresholds();
     set_env("BB_EXE","big2-ps4_Shipping.elf");
@@ -265,7 +441,9 @@ int main(void) {
     assert(receive(e,sizeof(e),500) && has(e,"\"e\":\"hello\"") && field(e,"seq")==0 && field(e,"boot")==1);
     assert(has(e,"\"exe\":\"u2\"") && has(e,"\"bin\":\"big2-ps4_Shipping.elf\"") && has(e,"\"base\":\"0xb400000\""));
     assert(field(e,"rumble")==0 && field(e,"led")==0 && has(e,"\"trig\":\"40,140\"") && field(e,"pid")>0);
-    expect_seq=1;
+    assert(field(e,"fx")==1 && field(e,"fxp")>0 && field(e,"fxc")==0 && field(e,"fxo")==0);
+    const int fx_udp=(int)field(e,"fxp");
+    note_seq(e);
 
     /* rumble and LED: only changes */
     runtime_unds_rumble(10,20);
@@ -285,11 +463,21 @@ int main(void) {
     no_event(30);
     runtime_unds_pad(0,128,128,128,128,0,0,0,60);            /* R2 travel under the threshold: a change */
     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0 && field(e,"r2a")==60 && field(e,"l2a")==0);
+    const uint64_t pressed_us=now_us();
     runtime_unds_pad(0x200,128,128,128,128,0,255,0,150);     /* R2 pressed: sent at once */
-    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255 && field(e,"r2a")==150);
     runtime_unds_pad(0x200,128,128,128,128,0,200,0,150);     /* analog only, <8 ms later: held */
     runtime_unds_pad(0x200,128,128,128,128,0,180,0,170);
-    assert(next_event(e,sizeof(e),400) && field(e,"r2")==180 && field(e,"r2a")==170); /* sent by the heartbeat */
+    const uint64_t held_us=now_us()-pressed_us;
+    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255 && field(e,"r2a")==150);
+    /* The newest analog state comes with the heartbeat. Only if this thread was held up for 8 ms
+     * or more between the calls (a busy Windows PC) may the middle one have gone out at once. */
+    assert(next_event(e,sizeof(e),400) && has(e,"\"e\":\"pad\""));
+    if (field(e,"r2")==200) {
+        printf("unds-test: the pad calls took %" PRIu64 " us: the middle state went out at once\n",held_us);
+        assert(held_us>=PAD_MIN_INTERVAL_US && "an analog change inside 8 ms was not held back");
+        assert(next_event(e,sizeof(e),400) && has(e,"\"e\":\"pad\""));
+    }
+    assert(field(e,"r2")==180 && field(e,"r2a")==170); /* sent by the heartbeat */
     runtime_unds_pad(0,128,128,128,128,0,0,0,0);             /* release: at once */
     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0);
 
@@ -303,7 +491,7 @@ int main(void) {
     int hello=0, refresh=0, state_refresh=0;
     for (int i=0;i<40 && (!hello || !refresh || !state_refresh);++i) {
         if (!receive(e,sizeof(e),100)) continue;
-        assert((uint32_t)field(e,"seq")==expect_seq); ++expect_seq;
+        note_seq(e);
         if (has(e,"\"e\":\"hello\"")) {
             hello=1;
             assert(field(e,"boot")==0 && field(e,"sent")>0 && has(e,"\"ports\":\"0:0:8:1024,17:4:1:256\""));
@@ -314,14 +502,29 @@ int main(void) {
     }
     assert(hello && refresh && state_refresh);
 
+    test_fx(fx_udp);
+    /* bye with R2 held: the triggers go off before the bye, and nothing is taken after it */
+    const int before_bye=reports();
     runtime_unds_bye("loadexec");
+    uint8_t r[UNDS_DS5_EFFECTS_SIZE];
+    last_report(r);
+    assert(reports()==before_bye+1 && r[0]==0x0c && r[10]==0x05 && r[21]==0x05);
     assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"bye\"") && has(e,"\"reason\":\"loadexec\""));
+    const uint8_t weapon[11]={0x25,0x18,0x00,0x07};
+    fx_cmd(fx_udp,UNDS_FX_RIGHT,12,weapon,NULL,NULL);
     runtime_unds_bye("again");
     runtime_unds_rumble(1,1);
     char extra[512];
-    assert(!receive(extra,sizeof(extra),600)); /* nothing after bye, not even the heartbeat */
+    assert(!receive(extra,sizeof(extra),600)); /* nothing after bye, not even the heartbeat or an fx answer */
+    assert(reports()==before_bye+1);
     runtime_unds_report();
     assert(!atomic_load(&errors) && !atomic_load(&dropped));
+    /* No send may wait on another thread (the fx receiver sits in select() on the same socket). */
+    const uint64_t longest=atomic_load(&send_max_ns_total);
+    printf("unds-test: longest sendto %" PRIu64 " us\n",longest/1000u);
+    assert(longest<250000000u && "a sendto waited 250 ms or more");
+    check_no_gaps();
+    printf("unds-test: %u datagrams, %u arrived ahead of an earlier one, longest %zu bytes\n",max_seq+1,reordered,longest_datagram);
     puts("unds-test: ok");
     return 0;
 }

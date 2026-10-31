@@ -1212,7 +1212,8 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
 }
 /* Light bar {r, g, b}: shown on controllers that have one (DualShock 4, DualSense). */
 static void set_led(uint8_t r, uint8_t g, uint8_t b) {
-    if (runtime_unds_led_enabled()) {
+    /* UNDS: not while the companion holds the light bar (control channel); it gets the colour from the "led" event */
+    if (runtime_unds_led_enabled() && !runtime_unds_fx_led_owned()) {
         pthread_mutex_lock(&lock);
         SDL_Gamepad *pad=current_gamepad();
         if (pad) SDL_SetGamepadLED(pad,r,g,b);
@@ -1231,6 +1232,48 @@ static ABI int32_t pad_reset_light_bar(int32_t handle) {
     set_led(0,0,255); /* user 1 colour */
     return 0;
 }
+/* UNDS control channel (runtime_unds.h): the companion's trigger effects and light bar, written by
+ * SDL (HIDAPI PS5 driver: the bytes go verbatim after the report id; USB and Bluetooth). Called
+ * from runtime_unds.c's receiver thread; SDL_SendGamepadEffect is thread-safe and only queues the
+ * report, so `lock` is held for microseconds. */
+int runtime_pad_unds_effect(const uint8_t *effects, int size) {
+    static int warned_type, warned_sdl; /* under lock */
+    int result=1;
+    pthread_mutex_lock(&lock);
+    SDL_Gamepad *pad=opened ? current_gamepad() : NULL;
+    if (!pad) result=0;
+    else if (SDL_GetGamepadType(pad)!=SDL_GAMEPAD_TYPE_PS5) {
+        result=-1;
+        if (!warned_type) {
+            warned_type=1;
+            const char *name=SDL_GetGamepadName(pad);
+            printf("Runtime: UNDS: fx: %s is not a DualSense: the companion's triggers and light bar are ignored\n",
+                   name ? name : "the controller");
+        }
+    } else if (!SDL_SendGamepadEffect(pad,effects,size)) {
+        result=-2;
+        if (!warned_sdl) {
+            warned_sdl=1;
+            printf("Runtime: UNDS: fx: SDL_SendGamepadEffect failed (%s); further failures are only counted\n",SDL_GetError());
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return result;
+}
+unsigned runtime_pad_unds_generation(void) {
+    pthread_mutex_lock(&lock);
+    const unsigned generation=connected_count;
+    pthread_mutex_unlock(&lock);
+    return generation;
+}
+void runtime_pad_unds_game_led(uint8_t r, uint8_t g, uint8_t b) {
+    if (!runtime_unds_led_enabled()) return;
+    pthread_mutex_lock(&lock);
+    SDL_Gamepad *pad=opened ? current_gamepad() : NULL;
+    if (pad) SDL_SetGamepadLED(pad,r,g,b);
+    pthread_mutex_unlock(&lock);
+}
+
 static ABI int32_t pad_ok_handle(int32_t handle) { return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }
 static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag; return pad_ok_handle(handle); }
 
