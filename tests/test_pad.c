@@ -14,6 +14,13 @@ int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel) {
 }
 int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds) { (void)yaw_degrees; (void)age_seconds; return 0; }
 void bbgpu_prompts_controller(int device) { (void)device; }
+/* UNDS event bus (runtime_unds.c): off in this test. */
+int runtime_unds_rumble_enabled(void) { return 1; }
+void runtime_unds_rumble(uint8_t large, uint8_t small) { (void)large; (void)small; }
+void runtime_unds_led(uint8_t r, uint8_t g, uint8_t b) { (void)r; (void)g; (void)b; }
+void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2) {
+    (void)buttons; (void)lx; (void)ly; (void)rx; (void)ry; (void)l2; (void)r2;
+}
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;

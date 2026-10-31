@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include <unistd.h>
 #include "runtime.h"
+#include "runtime_unds.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +113,7 @@ static ABI int32_t load_exec(const char *path, char *const *argv) {
     fprintf(f,"%s\n",path);
     for (int i=0;argv && argv[i] && i<32;++i) fprintf(f,"%s\n",argv[i]);
     fclose(f);
+    runtime_unds_bye("loadexec");
     fflush(NULL);
     _exit(RUNTIME_LOADEXEC_EXIT);
    __builtin_unreachable();

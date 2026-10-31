@@ -275,6 +275,12 @@ if (WIN32)
     add_executable(bb-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
     target_compile_options(bb-play PRIVATE -municode)
     target_link_options(bb-play PRIVATE -municode)
+    # UNDS event bus test (ninja -C out/gpu unds-test && out/gpu/unds-test.exe): no game, no GPU.
+    add_executable(unds-test EXCLUDE_FROM_ALL ../tests/test_unds.c ../src/compat_win.c)
+    set_target_properties(unds-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(unds-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    target_include_directories(unds-test PRIVATE ../src)
+    target_link_libraries(unds-test PRIVATE ws2_32 bcrypt -pthread)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.

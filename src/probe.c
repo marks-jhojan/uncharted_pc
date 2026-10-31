@@ -8,6 +8,7 @@
 #include <time.h>
 #include <cpuid.h>
 #include "runtime.h"
+#include "runtime_unds.h"
 #include "gpu/bbgpu.h"
 #ifdef _WIN32
 #include "red_zone.h"
@@ -1111,6 +1112,7 @@ static void patch_job_sleep(uint64_t image_size) {
  * applied at start). Descriptors are closed first so the old GPU device and its memory are
  * released before the new process opens its own. */
 void runtime_restart(void) {
+    runtime_unds_bye("restart");
     fflush(NULL);
 #ifdef _WIN32
     /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
@@ -1427,6 +1429,7 @@ int main(int argc, char **argv) {
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
     printf("Guest image at %p\n", (void *)image);
+    runtime_unds_start((uintptr_t)image); /* UNDS_EVENTS / UNDS_RUMBLE; silent without them */
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
             int init_executable=0;

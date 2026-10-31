@@ -8,6 +8,7 @@
  * ports only follow the clock. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_unds.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +153,7 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
         p->dump=fopen(path,"wb");
     }
     ++ports_opened;
+    runtime_unds_audio_open(id,type,p->channels,p->frames);
     pthread_mutex_unlock(&table_lock);
     printf("Runtime: audio port %d opened (type %d, %d ch, %s, %u frames%s)\n",id,type,p->channels,p->is_float ? "float" : "s16",length,
            p->out_channels==2 && p->channels==8 ? ", folded to stereo" : p->out_channels==6 && p->channels==8 ? ", folded to 5.1" : "");
@@ -194,6 +196,8 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
         }
         if (p->dump) fwrite(converted,1,bytes,p->dump);
+        /* UNDS: levels of what is about to be queued (after volume, SDL channel order). */
+        runtime_unds_audio((int)(p-ports),p->type,converted,p->frames,p->channels,p->is_float);
         /* Fewer speakers than the game's 7.1 mix: stereo gets FL/FR at full level and centre and
            surrounds at -3 dB (LFE dropped); 5.1 keeps FL FR FC LFE and adds the back pair to the
            sides at -3 dB. */

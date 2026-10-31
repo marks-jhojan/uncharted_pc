@@ -1,6 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "runtime_unds.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +84,7 @@ void runtime_report(void) {
     runtime_savedata_report();
     runtime_file_report();
     runtime_fiber_report();
+    runtime_unds_report();
     printf("Runtime: memory operations=%zu\n", (size_t)memory_calls);
 }
 static ABI void init_env(void) {
@@ -176,6 +178,7 @@ static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
 static ABI size_t guest_strlen(const char *text) { return strlen(text); }
 static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
     printf("Runtime: guest requested exit(%d)\n", status);
+    runtime_unds_bye("exit");
     runtime_finalize(NULL);
     runtime_report();
     exit(status);

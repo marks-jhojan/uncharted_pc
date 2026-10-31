@@ -17,6 +17,7 @@
  * Options, Tab touchpad, arrow keys and the wheel the d-pad, IJKL the right stick. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_unds.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1151,6 +1152,8 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     pthread_mutex_lock(&lock);
     sample(data); ++reads;
     pthread_mutex_unlock(&lock);
+    /* UNDS: the state the game just read; published outside `lock` (data is the caller's buffer). */
+    runtime_unds_pad(data->buttons,data->left_x,data->left_y,data->right_x,data->right_y,data->l2,data->r2);
     return 0;
 }
 /* Buffered read: the port samples once per call, so one entry is returned. */
@@ -1176,15 +1179,19 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
 static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
-    pthread_mutex_lock(&lock);
-    SDL_Gamepad *g=input.pad_vibration ? current_gamepad() : NULL;
-    if (g) {
-        const unsigned strength=(unsigned)input.pad_vibration_strength;
-        const uint16_t low=(uint16_t)((param[0]*257u*strength+50u)/100u);
-        const uint16_t high=(uint16_t)((param[1]*257u*strength+50u)/100u);
-        SDL_RumbleGamepad(g,low,high,1000);
+    const uint8_t large=param[0], small=param[1];
+    if (runtime_unds_rumble_enabled()) {
+        pthread_mutex_lock(&lock);
+        SDL_Gamepad *g=input.pad_vibration ? current_gamepad() : NULL;
+        if (g) {
+            const unsigned strength=(unsigned)input.pad_vibration_strength;
+            const uint16_t low=(uint16_t)((large*257u*strength+50u)/100u);
+            const uint16_t high=(uint16_t)((small*257u*strength+50u)/100u);
+            SDL_RumbleGamepad(g,low,high,1000);
+        }
+        pthread_mutex_unlock(&lock);
     }
-    pthread_mutex_unlock(&lock);
+    runtime_unds_rumble(large,small); /* UNDS: the game's values, also with UNDS_RUMBLE=0 or vibration off */
     return 0;
 }
 /* Light bar {r, g, b}: shown on controllers that have one (DualShock 4, DualSense). */
@@ -1193,6 +1200,7 @@ static void set_led(uint8_t r, uint8_t g, uint8_t b) {
     SDL_Gamepad *pad=current_gamepad();
     if (pad) SDL_SetGamepadLED(pad,r,g,b);
     pthread_mutex_unlock(&lock);
+    runtime_unds_led(r,g,b);
 }
 static ABI int32_t pad_light_bar(int32_t handle, const uint8_t *rgb) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;

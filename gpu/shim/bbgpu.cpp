@@ -49,6 +49,8 @@ uint64_t runtime_process_time_counter(void);
 uint64_t runtime_tsc_frequency(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
+// runtime_unds.c: "bye" for the UNDS event bus (nothing without UNDS_EVENTS)
+void runtime_unds_bye(const char* reason);
 }
 
 Frontend::WindowSDL* g_window = nullptr;
@@ -248,6 +250,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
             SDL_Delay(2);
         }
         std::printf("Window closed (close button, Alt+F4 or system quit request)\n");
+        runtime_unds_bye("window");
         std::fflush(stdout);
         Vulkan::FlushPipelineCacheForExit();
         std::_Exit(0);
